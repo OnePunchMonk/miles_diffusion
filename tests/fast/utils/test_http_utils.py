@@ -28,12 +28,16 @@ class _StubActorClass:
         return _StubActorHandle()
 
 
+# NodeAffinitySchedulingStrategy validates this for real: a node id is 28 bytes of hex.
+_FAKE_NODE_ID = "ab" * 28
+
+
 @pytest.fixture
 def recorded_options(monkeypatch):
     """Run _init_ray_distributed_post against stubbed Ray, returning the actor options."""
     options: list[dict] = []
     monkeypatch.setattr(ray, "remote", lambda cls: _StubActorClass(options))
-    monkeypatch.setattr(ray, "nodes", lambda: [{"NodeID": "node-a", "Alive": True}])
+    monkeypatch.setattr(ray, "nodes", lambda: [{"NodeID": _FAKE_NODE_ID, "Alive": True}])
     monkeypatch.setattr(http_utils, "_post_actors", [])
     monkeypatch.setattr(http_utils, "_client_concurrency", 8)
 
