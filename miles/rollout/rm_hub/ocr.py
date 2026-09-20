@@ -44,13 +44,28 @@ class OcrScorer:
         """
         from Levenshtein import distance
 
-        prompts = [prompt.split('"')[1] for prompt in prompts]
-        rewards = []
         # Ensure input lengths are consistent
         assert len(images) == len(
             prompts
         ), f"Images({len(images)}) and prompts({len(prompts)}) must have the same length"
-        for img, prompt in zip(images, prompts, strict=False):
+        rewards = []
+        for img, raw_prompt in zip(images, prompts, strict=False):
+            try:
+                # Prompts are expected to carry the OCR target quoted, e.g. `... "target text" ...`.
+                prompt = raw_prompt.split('"')[1]
+            except IndexError as e:
+                # Malformed prompt (fewer than two quote characters): treat as a scoring
+                # failure for this sample instead of crashing the whole batch.
+                logger.warning(f"OCR prompt missing quoted target, giving zero reward: {raw_prompt!r} ({e})")
+                rewards.append(0.0)
+                continue
+
+            if not prompt:
+                # Empty quoted target: nothing to match against, so there is no signal to score.
+                logger.warning(f"OCR prompt has an empty quoted target, giving zero reward: {raw_prompt!r}")
+                rewards.append(0.0)
+                continue
+
             # Convert image format
             if isinstance(img, Image.Image):
                 img = np.array(img)
@@ -77,7 +92,7 @@ class OcrScorer:
                 # Error handling (e.g., OCR parsing failure)
                 logger.warning(f"OCR processing failed: {e}")
                 dist = len(prompt)  # Maximum penalty
-            reward = 1 - dist / (len(prompt))
+            reward = 1 - dist / len(prompt)
             rewards.append(reward)
 
         return rewards
