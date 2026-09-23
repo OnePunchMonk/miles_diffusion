@@ -50,19 +50,10 @@ class OcrScorer:
         ), f"Images({len(images)}) and prompts({len(prompts)}) must have the same length"
         rewards = []
         for img, raw_prompt in zip(images, prompts, strict=False):
-            try:
-                # Prompts are expected to carry the OCR target quoted, e.g. `... "target text" ...`.
-                prompt = raw_prompt.split('"')[1]
-            except IndexError as e:
-                # Malformed prompt (fewer than two quote characters): treat as a scoring
-                # failure for this sample instead of crashing the whole batch.
-                logger.warning(f"OCR prompt missing quoted target, giving zero reward: {raw_prompt!r} ({e})")
-                rewards.append(0.0)
-                continue
-
+            quoted = raw_prompt.split('"')
+            prompt = quoted[1] if len(quoted) > 1 else ""
             if not prompt:
-                # Empty quoted target: nothing to match against, so there is no signal to score.
-                logger.warning(f"OCR prompt has an empty quoted target, giving zero reward: {raw_prompt!r}")
+                logger.warning(f"Filtering invalid OCR prompt (missing quoted target): {raw_prompt!r}")
                 rewards.append(0.0)
                 continue
 
