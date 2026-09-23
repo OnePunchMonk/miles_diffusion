@@ -56,8 +56,8 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help=(
                     "Number of GPUs for rollout-side work. For train-only SFT, leave unset to colocate encoders "
-                    "with training or set it to reserve dedicated encoder GPUs. Under --colocate this is overridden "
-                    "to actor_num_gpus_per_node * actor_num_nodes."
+                    "with training or set it to reserve dedicated encoder GPUs, which also lets encoding overlap "
+                    "training. Under --colocate this is overridden to actor_num_gpus_per_node * actor_num_nodes."
                 ),
             )
             parser.add_argument(
@@ -104,6 +104,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Whether to offload the rollout generator to CPU during training. "
                     "This will always be true when --colocate is set."
+                ),
+            )
+            parser.add_argument(
+                "--skip-train-actor-gc-collect",
+                action="store_true",
+                help=(
+                    "Skip gc.collect() in the train actor's clear_memory after each rollout's training; "
+                    "torch.cuda.empty_cache() still runs. A full collection over a large actor process costs "
+                    "0.2-0.5 s per rollout and frees no GPU memory."
                 ),
             )
 

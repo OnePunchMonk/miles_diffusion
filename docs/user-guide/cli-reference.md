@@ -113,13 +113,14 @@ See [Dtype Control](../advanced/dtype-control.md).
 |---|---|---|---|
 | `--actor-num-nodes` | int | `1` | |
 | `--actor-num-gpus-per-node` | int | `8` | |
-| `--rollout-num-gpus` | int | – | For train-only SFT, unset colocates encoders with training; set it to reserve dedicated encoder GPUs. |
+| `--rollout-num-gpus` | int | – | For train-only SFT, unset colocates encoders with training; set it to reserve dedicated encoder GPUs, which also lets encoding overlap training. |
 | `--rollout-num-gpus-per-engine` | int | `1` | Like sglang's `tp_size`. |
 | `--num-gpus-per-node` | int | `8` | |
 | `--colocate` | flag | off | Required: CUDA IPC weight sync currently supports only colocated trainer and rollout execution. |
 | `--offload` | flag | off | `--offload-train` + `--offload-rollout`. |
 | `--offload-train` / `--no-offload-train` | tri-state | – | Always on under `--colocate`. |
 | `--offload-rollout` / `--no-offload-rollout` | tri-state | – | Always on under `--colocate`. |
+| `--skip-train-actor-gc-collect` | flag | off | The train actor's `clear_memory` after each rollout's training skips `gc.collect()` and only releases the CUDA cache; saves 0.2-0.5 s per rollout on a large actor process. |
 | `--distributed-backend` | str | `nccl` | |
 | `--distributed-timeout-minutes` | int | `10` | |
 
