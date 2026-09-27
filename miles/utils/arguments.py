@@ -20,6 +20,7 @@ import yaml
 
 from miles.backends.sglang_diffusion_utils.arguments import add_sglang_diffusion_arguments
 from miles.backends.sglang_diffusion_utils.arguments import validate_args as sglang_validate_args
+from miles.utils.api_rm_config import resolve_api_rm_configs
 from miles.utils.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
 from miles.utils.logging_utils import configure_logger
 
@@ -56,8 +57,8 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help=(
                     "Number of GPUs for rollout-side work. For train-only SFT, leave unset to colocate encoders "
-                    "with training or set it to reserve dedicated encoder GPUs. Under --colocate this is overridden "
-                    "to actor_num_gpus_per_node * actor_num_nodes."
+                    "with training or set it to reserve dedicated encoder GPUs, which also lets encoding overlap "
+                    "training. Under --colocate this is overridden to actor_num_gpus_per_node * actor_num_nodes."
                 ),
             )
             parser.add_argument(
@@ -104,6 +105,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Whether to offload the rollout generator to CPU during training. "
                     "This will always be true when --colocate is set."
+                ),
+            )
+            parser.add_argument(
+                "--skip-train-actor-gc-collect",
+                action="store_true",
+                help=(
+                    "Skip gc.collect() in the train actor's clear_memory after each rollout's training; "
+                    "torch.cuda.empty_cache() still runs. A full collection over a large actor process costs "
+                    "0.2-0.5 s per rollout and frees no GPU memory."
                 ),
             )
 
@@ -1227,8 +1237,19 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 "--rm-type",
                 type=str,
                 default=None,
-                help="Built-in reward model (pickscore / hps / ocr). Ignored when --custom-rm-path is set.",
+                help="Built-in reward (pickscore / hps / ocr / openai_api), or custom_api for a configurable actor. "
+                "Ignored when --custom-rm-path is set.",
             )
+            for rm_type in ("custom_api", "openai_api"):
+                parser.add_argument(
+                    f"--{rm_type.replace('_', '-')}-rm-config",
+                    type=str,
+                    default=None,
+                    help=f"YAML file or inline base64:<payload> configuration for {rm_type}: "
+                    "actor_class, actor_kwargs, and max_concurrency. Defaults to the OpenAI-compatible image actor; "
+                    "flat OpenAI configuration is also accepted. Inline configs must embed prompt text; "
+                    "file configs may use prompt_path relative to the config file.",
+                )
             parser.add_argument(
                 "--reward-key",
                 type=str,
@@ -1687,14 +1708,15 @@ def miles_validate_args(args):
                 )
         if args.prompt_data is None:
             raise ValueError("--loss-type sft_loss requires --prompt-data (jsonl with prompt + metadata.video)")
-        if args.sft_encoder_checkpoint is None:
-            raise ValueError(
-                "--loss-type sft_loss requires --sft-encoder-checkpoint "
-                "(HF name or path holding the family's tokenizer/text_encoder/vae)"
-            )
-        from miles.rollout.encoder_hub import get_encoder
+        if args.rollout_function_path == "miles.rollout.sft_rollout.generate_rollout":
+            if args.sft_encoder_checkpoint is None:
+                raise ValueError(
+                    "--loss-type sft_loss requires --sft-encoder-checkpoint "
+                    "(HF name or path holding the family's tokenizer/text_encoder/vae)"
+                )
+            from miles.rollout.encoder_hub import get_encoder
 
-        get_encoder(args.diffusion_model_family).validate_args(args)
+            get_encoder(args.diffusion_model_family).validate_args(args)
         if args.fsdp_flow_shift is None:
             raise ValueError("--loss-type sft_loss requires --fsdp-flow-shift for the training sigma grid")
         if args.n_samples_per_prompt != 1:
@@ -1820,6 +1842,8 @@ def miles_validate_args(args):
         )
     if args.custom_rm_args is not None and args.custom_rm_path is None:
         raise ValueError("--custom-rm-args requires --custom-rm-path.")
+
+    resolve_api_rm_configs(args)
 
     if args.eval_function_path is None:
         args.eval_function_path = args.rollout_function_path
