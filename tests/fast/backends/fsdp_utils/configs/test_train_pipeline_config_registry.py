@@ -157,9 +157,7 @@ class TestCfgCombinePrefersTrueCfgScale:
         [SD3TrainPipelineConfig, Wan2_2TrainPipelineConfig, Krea2TrainPipelineConfig],
     )
     def test_true_cfg_scale_overrides_guidance_scale(self, config_cls):
-        out = config_cls().cfg_combine(
-            self.POS, self.NEG, self.GUIDANCE_SCALE, true_cfg_scale=self.TRUE_CFG_SCALE
-        )
+        out = config_cls().cfg_combine(self.POS, self.NEG, self.GUIDANCE_SCALE, true_cfg_scale=self.TRUE_CFG_SCALE)
         # neg + true_cfg_scale * (pos - neg), NOT guidance_scale
         torch.testing.assert_close(out, self.NEG + self.TRUE_CFG_SCALE * (self.POS - self.NEG))
 
