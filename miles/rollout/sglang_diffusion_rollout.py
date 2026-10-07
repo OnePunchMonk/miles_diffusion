@@ -384,8 +384,11 @@ async def generate_rollout_async(
     )
 
     # TODO: oversampling and abort
-    # there are still some unfinished requests, abort them
-    # aborted_samples = await abort(args, rollout_id)
+    # there are still some unfinished requests (e.g. resubmitted after dynamic-filter drops); cancel them so
+    # they don't keep running on the shared event loop after reset() forgets them
+    for task in state.pendings:
+        task.cancel()
+    await asyncio.gather(*state.pendings, return_exceptions=True)
 
     assert len(data) == args.rollout_batch_size, f"Got {len(data)} samples, expected {args.rollout_batch_size}"
     data = sorted(data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)
