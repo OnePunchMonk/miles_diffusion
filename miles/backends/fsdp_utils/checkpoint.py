@@ -33,16 +33,22 @@ def broadcast_full_state_to_fsdp(
     full_state: dict,
     *,
     cpu_offload: bool,
+    device=None,
 ) -> None:
     """Materialize FSDP2 shards from rank 0's full initial state dict."""
     from torch.distributed.checkpoint.state_dict import set_model_state_dict
 
-    if dist.get_rank() == 0:
-        # Rank 0 was sharded on real CPU weights; move them (and real buffers) along.
-        model.to(device=torch.cuda.current_device(), non_blocking=True)
-    else:
-        # to_empty creates tensors on device without initializing memory.
-        model.to_empty(device=torch.cuda.current_device())
+    device = torch.cuda.current_device() if device is None else device
+    # Every parameter is overwritten from full_state below, so no rank needs its local values on the
+    # device first. Rank 0 used to move its real CPU shard over (a slow pageable copy of 1/N of the
+    # model); now it allocates like the other ranks and only carries its real buffers across.
+    real_buffers = dict(model.named_buffers()) if dist.get_rank() == 0 else None
+    # to_empty creates tensors on device without initializing memory.
+    model.to_empty(device=device)
+    if real_buffers is not None:
+        with torch.no_grad():
+            for name, buffer in model.named_buffers():
+                buffer.copy_(real_buffers[name], non_blocking=True)
 
     set_model_state_dict(
         model,
