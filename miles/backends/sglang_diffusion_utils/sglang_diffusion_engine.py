@@ -6,16 +6,11 @@ import logging
 import multiprocessing
 import os
 import time
-from typing import TYPE_CHECKING
-
 import requests
 
 from miles.ray.ray_actor import RayActor
 from miles.utils.arguments import rollout_merges_lora
 from miles.utils.http_utils import get_host_info
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 

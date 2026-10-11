@@ -60,7 +60,6 @@ class RolloutManager:
         from miles.dashboard import hooks
 
         self._engine_init_handles = []
-        self._boot_offloaded = False
         hooks.register_rollout_manager(args)
         if not args.train_only:
             logger.info("RolloutManager: starting router...")
@@ -183,21 +182,6 @@ class RolloutManager:
         self._ensure_engines_ready()
         return True
 
-    def boot_offload_once(self):
-        """Startup fallback when the train init peak does not fit next to the resident engines.
-
-        Train ranks call this concurrently; the actor runs calls one at a time, so only the first offloads.
-        """
-        if not self._boot_offloaded:
-            self._boot_offloaded = True
-            self.offload()
-        return True
-
-    def onload_weights_if_boot_offloaded(self):
-        if self._boot_offloaded:
-            self.onload_weights()
-        return self._boot_offloaded
-
     def get_rollout_engines_and_lock(self):
         self._ensure_engines_ready()
         return self.rollout_engines, self.rollout_engine_lock, self.num_new_engines
@@ -253,6 +237,7 @@ class RolloutManager:
         if self.args.train_only:
             # if debug train only, we don't generate evaluation data
             return
+        self._ensure_engines_ready()
         self.health_monitoring_resume()
 
         result = call_rollout_fn(self.eval_generate_rollout, self.args, rollout_id, self.data_source, evaluation=True)

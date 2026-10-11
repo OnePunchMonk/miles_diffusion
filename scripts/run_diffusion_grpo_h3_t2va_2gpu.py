@@ -186,6 +186,9 @@ def execute(args: ScriptArgs, prompt_dir: str) -> None:
         "--deterministic-mode "
         "--rollout-health-check-interval 60 "
         "--miles-router-health-check-failure-threshold 30 "
+        # One tp2 engine rank holds about 62 GB of weights (about 65 GiB in use after boot), so the
+        # engines can stay resident while train init loads its shard next to them.
+        "--startup-engine-reserve-gib 72 "
     )
 
     U.execute_train(

@@ -7,31 +7,16 @@ import torch
 from miles.backends.fsdp_utils import startup_gate
 
 
-class _Remote:
-    def __init__(self, fn):
-        self.fn = fn
+class _Handle:
+    """Stands in for the driver's GpuReady handle: records the wait, optionally frees memory."""
 
-    def remote(self):
-        return self.fn()
+    def __init__(self, name, waited, on_wait=None):
+        self.name, self.waited, self.on_wait = name, waited, on_wait
 
-
-class FakeRolloutManager:
-    def __init__(self, on_offload=None):
-        self.calls = []
-        self.on_offload = on_offload
-        self.wait_engines_ready = _Remote(lambda: self.calls.append("wait") or True)
-        self.boot_offload_once = _Remote(self._offload)
-
-    def _offload(self):
-        self.calls.append("offload")
-        if self.on_offload:
-            self.on_offload()
-        return True
-
-
-@pytest.fixture
-def no_ray(monkeypatch):
-    monkeypatch.setattr(startup_gate.ray, "get", lambda x: x)
+    def wait(self):
+        self.waited.append(self.name)
+        if self.on_wait:
+            self.on_wait()
 
 
 def _free(monkeypatch, value):
@@ -55,44 +40,102 @@ def test_required_bytes_works_on_meta_params():
     assert startup_gate.required_bytes(model, 1, 0)[2] == 8 * 8 * 4 * 2
 
 
-def test_gate_keeps_engines_resident_when_it_fits(monkeypatch, no_ray):
+def test_gate_waits_for_the_handle_then_passes_when_it_fits(monkeypatch):
     _free(monkeypatch, 1 << 40)
-    rm = FakeRolloutManager()
-    startup_gate.wait_for_gpu_budget(torch.nn.Linear(4, 4), shard_world_size=1, rollout_manager=rm)
-    assert rm.calls == ["wait"]
+    waited = []
+    startup_gate.wait_for_gpu_budget(
+        torch.nn.Linear(4, 4), shard_world_size=1, gpu_ready=_Handle("engines-offloaded", waited)
+    )
+    assert waited == ["engines-offloaded"]
 
 
-def test_gate_offloads_engines_when_it_does_not_fit(monkeypatch, no_ray):
+def test_gate_passes_once_the_handle_frees_memory(monkeypatch):
     state = _free(monkeypatch, 1)
-    rm = FakeRolloutManager(on_offload=lambda: state.update(free=1 << 40))
-    startup_gate.wait_for_gpu_budget(torch.nn.Linear(4, 4), shard_world_size=1, rollout_manager=rm)
-    assert rm.calls == ["wait", "offload"]
+    waited = []
+    handle = _Handle("engines-offloaded", waited, on_wait=lambda: state.update(free=1 << 40))
+    startup_gate.wait_for_gpu_budget(torch.nn.Linear(4, 4), shard_world_size=1, gpu_ready=handle)
+    assert waited == ["engines-offloaded"]
 
 
-def test_gate_raises_when_offload_does_not_free_enough(monkeypatch, no_ray):
+def test_gate_raises_when_it_never_fits(monkeypatch):
     _free(monkeypatch, 1)
     monkeypatch.setenv("MILES_STARTUP_GATE_TIMEOUT_S", "0.3")
-    rm = FakeRolloutManager()
     with pytest.raises(RuntimeError, match="startup gate"):
-        startup_gate.wait_for_gpu_budget(torch.nn.Linear(4, 4), shard_world_size=1, rollout_manager=rm)
+        startup_gate.wait_for_gpu_budget(
+            torch.nn.Linear(4, 4), shard_world_size=1, gpu_ready=_Handle("engines-ready", [])
+        )
 
 
-def test_reserve_lets_train_go_before_engines_when_it_fits(monkeypatch, no_ray):
+def test_reserve_lets_train_go_before_the_engines_when_it_fits(monkeypatch):
     _free(monkeypatch, 100 << 30)
-    rm = FakeRolloutManager()
+    waited = []
     startup_gate.wait_for_gpu_budget(
-        torch.nn.Linear(4, 4), shard_world_size=1, rollout_manager=rm, engine_reserve_gib=60
+        torch.nn.Linear(4, 4), shard_world_size=1, gpu_ready=_Handle("engines-ready", waited), engine_reserve_gib=60
     )
-    assert rm.calls == []
+    assert waited == []
 
 
-def test_reserve_falls_back_to_waiting_for_engines_when_it_does_not_fit(monkeypatch, no_ray):
+def test_reserve_that_does_not_fit_falls_back_to_waiting(monkeypatch):
     _free(monkeypatch, 100 << 30)
-    rm = FakeRolloutManager()
+    waited = []
     startup_gate.wait_for_gpu_budget(
-        torch.nn.Linear(4, 4), shard_world_size=1, rollout_manager=rm, engine_reserve_gib=99
+        torch.nn.Linear(4, 4), shard_world_size=1, gpu_ready=_Handle("engines-ready", waited), engine_reserve_gib=99
     )
-    assert rm.calls == ["wait"]
+    assert waited == ["engines-ready"]
+
+
+def test_driver_picks_what_train_waits_for():
+    import argparse
+
+    from miles.ray import placement_group as pg
+
+    class _RM:
+        wait_engines_ready = type("R", (), {"remote": staticmethod(lambda: "engines-ready")})
+        offload = type("R", (), {"remote": staticmethod(lambda: "engines-offloaded")})
+
+    def args(**kw):
+        base = dict(offload_rollout=True, serial_startup=False, startup_engine_reserve_gib=None)
+        return argparse.Namespace(**{**base, **kw})
+
+    assert pg._startup_gpu_ready(args(offload_rollout=False), _RM) is None
+    assert pg._startup_gpu_ready(args(serial_startup=True), _RM) is None
+    assert pg._startup_gpu_ready(args(), _RM)._ref == "engines-offloaded"
+    assert pg._startup_gpu_ready(args(startup_engine_reserve_gib=72), _RM)._ref == "engines-ready"
+    assert pg.engines_stay_resident_at_startup(args(startup_engine_reserve_gib=72))
+    assert not pg.engines_stay_resident_at_startup(args())
+
+
+def test_gpu_ready_reaches_the_task_unresolved_and_the_task_starts_first():
+    """Ray resolves top-level ref args before a task runs; GpuReady must not let that happen."""
+    import time
+
+    ray = pytest.importorskip("ray")
+    ray.init(num_cpus=2, include_dashboard=False, ignore_reinit_error=True, log_to_driver=False)
+    try:
+
+        @ray.remote
+        class Engines:
+            def ready(self, delay):
+                time.sleep(delay)
+                return time.time()
+
+        @ray.remote
+        class Train:
+            def init(self, gpu_ready):
+                started = time.time()
+                unresolved = isinstance(gpu_ready._ref, ray.ObjectRef)
+                gpu_ready.wait()
+                return started, unresolved
+
+        engines, train = Engines.remote(), Train.remote()
+        ray.get([engines.__ray_ready__.remote(), train.__ray_ready__.remote()])  # workers up first
+        ready = startup_gate.GpuReady(engines.ready.remote(8.0))
+        started, unresolved = ray.get(train.init.remote(ready))
+        resolved = ray.get(ready._ref)
+        assert unresolved
+        assert started < resolved - 4.0  # train init began well before the engines were ready
+    finally:
+        ray.shutdown()
 
 
 def test_picklable_args_drops_only_unpicklable_values():

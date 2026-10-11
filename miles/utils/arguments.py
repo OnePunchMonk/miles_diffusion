@@ -131,9 +131,10 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 type=float,
                 default=None,
                 help=(
-                    "Upper bound on the GPU memory one colocated rollout engine rank holds after boot. When set, "
-                    "train ranks start their GPU load as soon as it fits next to that reserve instead of waiting "
-                    "for engine init to finish. Unset: wait for engine init."
+                    "Upper bound (GiB) on the GPU memory one colocated rollout engine rank holds after boot. When "
+                    "set, the engines keep their weights through train init (no startup offload/onload) and a "
+                    "train rank starts its GPU load as soon as it fits next to that reserve. Unset: the engines "
+                    "are offloaded during train init and reloaded before the first weight sync."
                 ),
             )
             parser.add_argument(

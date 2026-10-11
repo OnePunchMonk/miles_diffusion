@@ -90,12 +90,12 @@ class RayTrainGroup:
             [actor.set_master_addr_and_port.remote(master_addr, master_port) for actor in self._actor_handlers[1:]]
         )
 
-    def async_init(self, args, role, with_ref=False, rollout_manager=None):
+    def async_init(self, args, role, with_ref=False, gpu_ready=None):
         """
         Allocate GPU resourced and initialize model, optimzier, local ckpt, etc.
         """
         self.args = args
-        kwargs = {} if rollout_manager is None else {"rollout_manager": rollout_manager}
+        kwargs = {} if gpu_ready is None else {"gpu_ready": gpu_ready}
         return [actor.init.remote(args, role, with_ref=with_ref, **kwargs) for actor in self._actor_handlers]
 
     def async_train(self, rollout_id, rollout_data_ref):
