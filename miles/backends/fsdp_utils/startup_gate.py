@@ -45,7 +45,18 @@ def _wait_free(need: int, timeout: float) -> int:
         time.sleep(0.25)
 
 
-def wait_for_gpu_budget(model: torch.nn.Module, *, shard_world_size: int, rollout_manager) -> None:
+def _all_ranks_agree(ok: bool) -> bool:
+    # Every rank must take the same branch, or one rank offloads while another allocates.
+    if not dist.is_initialized():
+        return ok
+    flag = torch.tensor([int(ok)], dtype=torch.int32)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=_gloo_group())
+    return bool(flag.item())
+
+
+def wait_for_gpu_budget(
+    model: torch.nn.Module, *, shard_world_size: int, rollout_manager, engine_reserve_gib: float | None = None
+) -> None:
     margin = int(float(os.environ.get("MILES_STARTUP_GATE_MARGIN_GIB", "4")) * GIB)
     timeout = float(os.environ.get("MILES_STARTUP_GATE_TIMEOUT_S", "900"))
     shard, largest, need = required_bytes(model, shard_world_size, margin)
@@ -55,15 +66,18 @@ def wait_for_gpu_budget(model: torch.nn.Module, *, shard_world_size: int, rollou
         shard_gib=f"{shard / GIB:.1f}",
         largest_gib=f"{largest / GIB:.2f}",
     ):
+        if engine_reserve_gib is not None:
+            # Free memory already excludes whatever the engine has allocated, so subtracting the full reserve
+            # can only over-count: if this fits, the engine's remaining load fits too.
+            free = torch.cuda.mem_get_info()[0]
+            reserve = int(engine_reserve_gib * GIB)
+            if _all_ranks_agree(free - reserve >= need):
+                st.mark("train.budget_gate.free", free_gib=f"{free / GIB:.1f}", engines_resident=-1)
+                return
         with st.step("train.budget_gate.wait_engines"):
             ray.get(rollout_manager.wait_engines_ready.remote())
         free = torch.cuda.mem_get_info()[0]
-        fits = free >= need
-        # Every rank must agree, or one rank offloads while another allocates.
-        if dist.is_initialized():
-            flag = torch.tensor([int(fits)], dtype=torch.int32)
-            dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=_gloo_group())
-            fits = bool(flag.item())
+        fits = _all_ranks_agree(free >= need)
         if not fits:
             logger.info(
                 "startup gate: %.1f GiB free next to the engines, need %.1f GiB; offloading the engines",

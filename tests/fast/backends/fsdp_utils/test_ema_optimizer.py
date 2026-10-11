@@ -153,6 +153,7 @@ def test_actor_train_updates_ema_once_and_publication_only_reads_it():
         nullcontext=nullcontext,
         clear_memory=lambda: None,
         train_metric_utils=SimpleNamespace(log_perf_data_raw=lambda **kwargs: None),
+        st=SimpleNamespace(step=lambda *args, **kwargs: nullcontext(), mark=lambda *args, **kwargs: None),
     )
     exec(compile(ast.Module(body=methods, type_ignores=[]), str(path), "exec"), namespace)
 

@@ -12,7 +12,6 @@ import numpy as np
 import ray
 import torch
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 
 import miles.utils.startup_timing as st
 from miles.backends.sglang_diffusion_utils.sglang_diffusion_engine import SGLangDiffusionEngine
@@ -45,6 +44,9 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+# sglang.srt.constants.GPU_MEMORY_TYPE_WEIGHTS; importing it pulls in all of sglang (~10 s) at actor start.
+GPU_MEMORY_TYPE_WEIGHTS = "weights"
 
 
 @ray.remote

@@ -58,7 +58,10 @@ def load_fsdp_models(
         full_state = model.state_dict() if materialize_weights else {}
         if rollout_manager is not None:
             wait_for_gpu_budget(
-                model, shard_world_size=parallel_state.get_mesh("fsdp").size(), rollout_manager=rollout_manager
+                model,
+                shard_world_size=parallel_state.get_mesh("fsdp").size(),
+                rollout_manager=rollout_manager,
+                engine_reserve_gib=args.startup_engine_reserve_gib,
             )
         model = apply_fsdp2(
             model,

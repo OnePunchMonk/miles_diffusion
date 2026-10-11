@@ -100,3 +100,21 @@ def test_probe_lines_round_trip_through_parser(tmp_path):
     names = [e["event"] for e in events]
     assert "driver.x.begin" in names and "driver.x.end" in names and "driver.startup_done" in names
     assert next(e for e in events if e["event"] == "driver.x.end")["dur"] >= 0
+
+
+def test_reserve_lets_train_go_before_engines_when_it_fits(monkeypatch, no_ray):
+    _free(monkeypatch, 100 << 30)
+    rm = FakeRolloutManager()
+    startup_gate.wait_for_gpu_budget(
+        torch.nn.Linear(4, 4), shard_world_size=1, rollout_manager=rm, engine_reserve_gib=60
+    )
+    assert rm.calls == []
+
+
+def test_reserve_falls_back_to_waiting_for_engines_when_it_does_not_fit(monkeypatch, no_ray):
+    _free(monkeypatch, 100 << 30)
+    rm = FakeRolloutManager()
+    startup_gate.wait_for_gpu_budget(
+        torch.nn.Linear(4, 4), shard_world_size=1, rollout_manager=rm, engine_reserve_gib=99
+    )
+    assert rm.calls == ["wait"]

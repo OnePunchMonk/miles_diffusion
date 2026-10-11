@@ -9,7 +9,6 @@ import time
 from typing import TYPE_CHECKING
 
 import requests
-from sglang.srt.utils.common import kill_process_tree
 
 import miles.utils.startup_timing as st
 from miles.ray.ray_actor import RayActor
@@ -360,6 +359,8 @@ class SGLangDiffusionEngine(RayActor):
 
             if response is not None:
                 response.raise_for_status()
+        from sglang.srt.utils.common import kill_process_tree
+
         kill_process_tree(self.process.pid)
 
     def release_memory_occupation(self):

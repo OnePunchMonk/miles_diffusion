@@ -118,6 +118,16 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--startup-engine-reserve-gib",
+                type=float,
+                default=None,
+                help=(
+                    "Upper bound on the GPU memory one colocated rollout engine rank holds after boot. When set, "
+                    "train ranks start their GPU load as soon as it fits next to that reserve instead of waiting "
+                    "for engine init to finish. Unset: wait for engine init."
+                ),
+            )
+            parser.add_argument(
                 "--skip-train-actor-gc-collect",
                 action="store_true",
                 help=(
