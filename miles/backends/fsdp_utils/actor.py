@@ -1,5 +1,7 @@
+import importlib
 import logging
 import os
+import threading
 from argparse import Namespace
 from contextlib import nullcontext
 
@@ -31,13 +33,6 @@ from miles.utils.train_data_utils import (
 
 from . import checkpoint
 from .device_move import move_model, move_optimizer, sleep_frozen_model, wake_up_frozen_model
-from .diffusion_update_weight_utils import (
-    DiffusionUpdateWeightFromDistributed,
-    DiffusionUpdateWeightFromTensor,
-    DiffusionUpdateWeightFromTensorLoRA,
-    DiffusionUpdateWeightFromTensorLoRAIPC,
-    DiffusionUpdateWeightLoRADistributed,
-)
 from .ema import EMAOptimizer, reshard_model
 from .input_dtype_policy import apply_input_dtype_policy
 from .loss_hub import DiffusionLossContext, flow_grpo_loss_formula, prepare_flow_grpo_batch
@@ -70,6 +65,12 @@ class FSDPTrainRayActor(TrainRayActor):
     @with_defer(lambda: Timer().start("train_wait"))
     def init(self, args: Namespace, role: str, with_ref: bool = False, rollout_manager=None) -> int:  # type: ignore[override]
         st.mark("train.init_enter", rank=os.environ.get("RANK", "?"))
+        # The weight-sync helpers import sglang (~25 s). Start that now so it overlaps model loading;
+        # the updater is built at the end of init.
+        self._update_utils_import = threading.Thread(
+            target=importlib.import_module, args=(f"{__package__}.diffusion_update_weight_utils",), daemon=True
+        )
+        self._update_utils_import.start()
         with st.step("train.super_init"):
             super().init(args, role, with_ref)
 
@@ -216,6 +217,16 @@ class FSDPTrainRayActor(TrainRayActor):
                 keep_previous=args.async_exact_resume,
             )
         checkpoint_payload = checkpoint.load(self)
+
+        with st.step("train.wait_update_utils_import"):
+            self._update_utils_import.join()
+        from .diffusion_update_weight_utils import (
+            DiffusionUpdateWeightFromDistributed,
+            DiffusionUpdateWeightFromTensor,
+            DiffusionUpdateWeightFromTensorLoRA,
+            DiffusionUpdateWeightFromTensorLoRAIPC,
+            DiffusionUpdateWeightLoRADistributed,
+        )
 
         # sglang-d now supports /update_weights_from_tensor (PR #20464).
         if self.args.train_only:
