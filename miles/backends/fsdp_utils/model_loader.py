@@ -10,6 +10,7 @@ import torch.distributed as dist
 
 from . import checkpoint
 from .device_move import move_model
+from .startup_gate import budget_gate_enabled, wait_for_gpu_budget
 from .mixed_precision import compile_param_dtype_maps, parse_dtype_from_str
 from .sequence_parallel.plan import apply_sequence_parallel
 
@@ -26,6 +27,7 @@ def load_fsdp_models(
     lora_adapter_paths: list[str] | None = None,
     trainable: bool = False,
     cpu_offload: bool = False,
+    rollout_manager=None,
 ) -> dict[str, torch.nn.Module]:
     materialize_weights = dist.get_rank() == 0
     master_dtype = parse_dtype_from_str(args.fsdp_master_dtype)
@@ -54,6 +56,10 @@ def load_fsdp_models(
             raise RuntimeError(f"{component} did not honor meta initialization")
         checkpoint.sync_model_dtypes(model)
         full_state = model.state_dict() if materialize_weights else {}
+        if trainable and budget_gate_enabled():
+            wait_for_gpu_budget(
+                model, shard_world_size=parallel_state.get_mesh("fsdp").size(), rollout_manager=rollout_manager
+            )
         model = apply_fsdp2(
             model,
             model_backend.fsdp_parallel_plan(model),
