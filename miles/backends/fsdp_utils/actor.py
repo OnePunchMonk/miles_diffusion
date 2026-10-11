@@ -1,4 +1,5 @@
 import logging
+import os
 from argparse import Namespace
 from contextlib import nullcontext
 
@@ -11,6 +12,7 @@ import miles.backends.fsdp_utils.configs.krea2  # noqa: F401 — register pipeli
 import miles.backends.fsdp_utils.configs.qwen_image  # noqa: F401 — register pipeline config
 import miles.backends.fsdp_utils.configs.sd3  # noqa: F401 — register pipeline config
 import miles.backends.fsdp_utils.configs.wan2_2  # noqa: F401 — register pipeline config
+import miles.utils.startup_timing as st
 from miles.ray.train_actor import TrainRayActor
 from miles.utils import tracking_utils, train_metric_utils
 from miles.utils.context_utils import with_defer
@@ -66,8 +68,10 @@ class FSDPTrainRayActor(TrainRayActor):
     """
 
     @with_defer(lambda: Timer().start("train_wait"))
-    def init(self, args: Namespace, role: str, with_ref: bool = False) -> int:  # type: ignore[override]
-        super().init(args, role, with_ref)
+    def init(self, args: Namespace, role: str, with_ref: bool = False, rollout_manager=None) -> int:  # type: ignore[override]
+        st.mark("train.init_enter", rank=os.environ.get("RANK", "?"))
+        with st.step("train.super_init"):
+            super().init(args, role, with_ref)
 
         if args.deterministic_mode:
             _enable_deterministic_training(args)
@@ -104,16 +108,18 @@ class FSDPTrainRayActor(TrainRayActor):
             # flash-attn is opaque to torch's determinism flag; backends patch their own dispatch.
             self.model_backend.enable_deterministic_attention(args.fsdp_attention_backend)
         self.scheduler = self.model_backend.load_scheduler(args)
-        self.models = load_fsdp_models(
-            args,
-            self.model_backend,
-            self.train_pipeline_config,
-            self.parallel_state,
-            checkpoint_path=args.hf_checkpoint,
-            lora_adapter_paths=args.lora_adapter_paths,
-            trainable=True,
-            cpu_offload=args.fsdp_cpu_offload,
-        )
+        with st.step("train.load_fsdp_models"):
+            self.models = load_fsdp_models(
+                args,
+                self.model_backend,
+                self.train_pipeline_config,
+                self.parallel_state,
+                checkpoint_path=args.hf_checkpoint,
+                lora_adapter_paths=args.lora_adapter_paths,
+                trainable=True,
+                cpu_offload=args.fsdp_cpu_offload,
+                rollout_manager=rollout_manager,
+            )
         self.reference_models = {}
         if args.ref_load is not None:
             self.reference_models = load_fsdp_models(
@@ -124,6 +130,7 @@ class FSDPTrainRayActor(TrainRayActor):
                 checkpoint_path=args.ref_load,
                 lora_adapter_paths=args.ref_lora_adapter_paths,
                 cpu_offload=args.ref_cpu_offload,
+                rollout_manager=rollout_manager,
             )
         self.teacher_models = {}
         if args.teacher_load is not None:
@@ -135,6 +142,7 @@ class FSDPTrainRayActor(TrainRayActor):
                 checkpoint_path=args.teacher_load,
                 lora_adapter_paths=args.teacher_lora_adapter_paths,
                 cpu_offload=args.teacher_cpu_offload,
+                rollout_manager=rollout_manager,
             )
         # A natively CPU-offloaded model never sleeps: its parameters stay on the host and its buffers on the GPU.
         self.actor_models_to_sleep = [] if args.fsdp_cpu_offload else list(self.models.values())
@@ -229,7 +237,9 @@ class FSDPTrainRayActor(TrainRayActor):
         checkpoint.finalize_load(self, checkpoint_payload)
 
         if self.args.offload_train:
-            self.sleep()
+            with st.step("train.offload_after_init"):
+                self.sleep()
+        st.mark("train.init_done")
 
         return self.args.start_rollout_id
 
@@ -283,12 +293,14 @@ class FSDPTrainRayActor(TrainRayActor):
             dist.barrier(group=get_gloo_group())
             return
 
-        rollout_engines, rollout_engine_lock, num_new_engines = ray.get(
-            self.rollout_manager.get_rollout_engines_and_lock.remote()
-        )
+        with st.step("train.uw.get_engines"):
+            rollout_engines, rollout_engine_lock, num_new_engines = ray.get(
+                self.rollout_manager.get_rollout_engines_and_lock.remote()
+            )
         if num_new_engines > 0:
-            self.weight_updater.connect_rollout_engines(rollout_engines, rollout_engine_lock)
-            dist.barrier(group=get_gloo_group())
+            with st.step("train.uw.connect_engines"):
+                self.weight_updater.connect_rollout_engines(rollout_engines, rollout_engine_lock)
+                dist.barrier(group=get_gloo_group())
             if dist.get_rank() == 0:
                 ray.get(self.rollout_manager.clear_num_new_engines.remote())
 
@@ -297,7 +309,7 @@ class FSDPTrainRayActor(TrainRayActor):
             if self.args.rollout_weights == "ema"
             else nullcontext()
         )
-        with rollout_weight_context:
+        with rollout_weight_context, st.step("train.uw.push_weights"):
             self.weight_updater.update_weights()
         clear_memory()
 

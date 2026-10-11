@@ -1,6 +1,7 @@
 import itertools
 import logging
 import multiprocessing
+import os
 import random
 import threading
 import time
@@ -11,8 +12,8 @@ import numpy as np
 import ray
 import torch
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 
+import miles.utils.startup_timing as st
 from miles.backends.sglang_diffusion_utils.sglang_diffusion_engine import SGLangDiffusionEngine
 from miles.ray.data_conversion_hub.flow_grpo import (
     expand_samples_to_train_pairs as flow_grpo_expand_samples_to_train_pairs,
@@ -44,6 +45,9 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
+# sglang.srt.constants.GPU_MEMORY_TYPE_WEIGHTS; importing it pulls in all of sglang (~10 s) at actor start.
+GPU_MEMORY_TYPE_WEIGHTS = "weights"
+
 
 @ray.remote
 class RolloutManager:
@@ -52,24 +56,32 @@ class RolloutManager:
     def __init__(self, args, pg):
         configure_logger()
 
+        st.set_role("rollout_manager")
+        st.mark("rm.init_enter")
         logger.info("RolloutManager init start")
         self.args = args
         self.pg = pg
         from miles.dashboard import hooks
 
-        hooks.register_rollout_manager(args)
+        self._engine_init_handles = []
+        self._boot_offloaded = False
+        with st.step("rm.dashboard_register"):
+            hooks.register_rollout_manager(args)
         if not args.train_only:
             logger.info("RolloutManager: starting router...")
-            _start_router(args)
+            with st.step("rm.start_router"):
+                _start_router(args)
         logger.info("RolloutManager: router started, init tracking...")
         # TODO make args immutable
-        init_tracking(args, primary=False, router_addr=f"http://{args.sglang_router_ip}:{args.sglang_router_port}")
+        with st.step("rm.init_tracking"):
+            init_tracking(args, primary=False, router_addr=f"http://{args.sglang_router_ip}:{args.sglang_router_port}")
         logger.info("RolloutManager: init http client...")
         init_http_client(args)
         logger.info("RolloutManager: loading data source...")
 
-        data_source_cls = load_function(self.args.data_source_path)
-        self.data_source = data_source_cls(args)
+        with st.step("rm.load_data_source"):
+            data_source_cls = load_function(self.args.data_source_path)
+            self.data_source = data_source_cls(args)
         logger.info("RolloutManager: data source loaded, loading rollout functions...")
 
         self.generate_rollout = load_function(self.args.rollout_function_path)
@@ -100,17 +112,14 @@ class RolloutManager:
             self.num_new_engines = 0
             logger.info("RolloutManager using no sglang engines (train_only).")
         else:
-            num_gpu_per_engine = min(args.rollout_num_gpus_per_engine, args.num_gpus_per_node)
-            num_engines = args.rollout_num_gpus // num_gpu_per_engine
-            self.all_rollout_engines = [None] * num_engines
-            self.num_new_engines = init_rollout_engines(args, pg, self.all_rollout_engines)
-            logger.info("RolloutManager started %s rollout engines", len(self.all_rollout_engines))
+            self._launch_engines()
         # pools outlive every rollout call, so the manager seats them and the rm functions find them as singletons
         _, bundle_indices, gpu_ids = pg
         self.reward_slots = ColocatedRewardSlots(
             bundle_deal_order(bundle_indices, gpu_ids, args.num_gpus_per_node, args.rollout_num_gpus_per_engine)
         )
-        self.reward_pools = create_colocated_reward_pools(args, pg, self.reward_slots)
+        with st.step("rm.create_reward_pools"):
+            self.reward_pools = create_colocated_reward_pools(args, pg, self.reward_slots)
         logger.info("RolloutManager colocated reward slots: %s", self.reward_slots)
         self.encode_pool = SftEncodePool(args, pg) if args.loss_type == "sft_loss" else None
         logger.info("RolloutManager: creating lock...")
@@ -161,7 +170,47 @@ class RolloutManager:
         # when doing multi-node serving, we will only send request to node-0 for each engine.
         return self.all_rollout_engines[:: self.nodes_per_engine]
 
+    def _launch_engines(self):
+        args = self.args
+        num_gpu_per_engine = min(args.rollout_num_gpus_per_engine, args.num_gpus_per_node)
+        num_engines = args.rollout_num_gpus // num_gpu_per_engine
+        self.all_rollout_engines = [None] * num_engines
+        # Defer so train init overlaps engine boot. --debug-rollout-only crashes unless init is synced.
+        defer = not args.serial_startup and not args.debug_rollout_only
+        with st.step("rm.init_rollout_engines", num_engines=num_engines, deferred=int(defer)):
+            self.num_new_engines, self._engine_init_handles = _init_rollout_engines(
+                args, self.pg, self.all_rollout_engines, defer_init=defer
+            )
+        logger.info("RolloutManager started %s rollout engines", len(self.all_rollout_engines))
+
+    def _ensure_engines_ready(self):
+        """Surface deferred engine init errors. Engine calls queue behind init on the engine actors anyway."""
+        if self._engine_init_handles:
+            with st.step("rm.engines.init_wait"):
+                ray.get(self._engine_init_handles)
+            self._engine_init_handles = []
+
+    def wait_engines_ready(self):
+        self._ensure_engines_ready()
+        return True
+
+    def boot_offload_once(self):
+        """Startup fallback when the train init peak does not fit next to the resident engines.
+
+        Train ranks call this concurrently; the actor runs calls one at a time, so only the first offloads.
+        """
+        if not self._boot_offloaded:
+            self._boot_offloaded = True
+            self.offload()
+        return True
+
+    def onload_weights_if_boot_offloaded(self):
+        if self._boot_offloaded:
+            self.onload_weights()
+        return self._boot_offloaded
+
     def get_rollout_engines_and_lock(self):
+        self._ensure_engines_ready()
         return self.rollout_engines, self.rollout_engine_lock, self.num_new_engines
 
     def get_num_rollout_per_epoch(self):
@@ -172,6 +221,7 @@ class RolloutManager:
         """`train_in_flight`: refs of the train step this generate overlaps; colocated SFT encoders wait for them."""
         from miles.dashboard import hooks
 
+        self._ensure_engines_ready()
         start_time = time.time()
         self.rollout_id = rollout_id
         if self.encode_pool is not None:
@@ -244,7 +294,7 @@ class RolloutManager:
 
     def offload(self):
         self.health_monitoring_pause()
-        with timer("rollout_offload"):
+        with timer("rollout_offload"), st.step("rm.offload"):
             return ray.get(
                 [engine.release_memory_occupation.remote() for engine in self.rollout_engines if engine is not None]
             )
@@ -494,8 +544,14 @@ class RolloutManager:
 
 
 def init_rollout_engines(args, pg, all_rollout_engines):
+    num_new_engines, _ = _init_rollout_engines(args, pg, all_rollout_engines, defer_init=False)
+    return num_new_engines
+
+
+def _init_rollout_engines(args, pg, all_rollout_engines, defer_init):
+    """Create engines and start init. With defer_init the init handles are returned unawaited."""
     if args.train_only:
-        return 0
+        return 0, []
 
     num_gpu_per_engine = min(args.rollout_num_gpus_per_engine, args.num_gpus_per_node)
     num_engines = args.rollout_num_gpus // num_gpu_per_engine
@@ -532,6 +588,8 @@ def init_rollout_engines(args, pg, all_rollout_engines):
             "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
             "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
             "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
+            # The RunAI streamer is copy-bound (~2.4 GiB/s even from a warm page cache); mmap is much faster.
+            "SGLANG_USE_RUNAI_MODEL_STREAMER": "true" if os.environ.get("MILES_SGLANG_USE_RUNAI_STREAMER") == "1" else "false",
         }
         if rollout_merges_lora(args):
             # Merge in the train forward dtype, not fp32, to cut train/rollout consistency error.
@@ -552,7 +610,7 @@ def init_rollout_engines(args, pg, all_rollout_engines):
     num_new_engines = len(rollout_engines)
 
     if num_new_engines == 0:
-        return num_new_engines
+        return num_new_engines, []
 
     addr_and_ports = _allocate_rollout_engine_addr_and_ports_normal(
         args=args, num_engines=num_engines, rollout_engines=rollout_engines
@@ -561,9 +619,11 @@ def init_rollout_engines(args, pg, all_rollout_engines):
     # TODO: don't ray.get here to overlap train actor init with rollout engine init.
     # somehow if we don't sync here, the --debug-rollout-only mode will crash.
     init_handles = [engine.init.remote(**(addr_and_ports[rank])) for rank, engine in rollout_engines]
+    if defer_init:
+        return num_new_engines, init_handles
     ray.get(init_handles)
 
-    return num_new_engines
+    return num_new_engines, []
 
 
 def _allocate_rollout_engine_addr_and_ports_normal(*, args, num_engines, rollout_engines):

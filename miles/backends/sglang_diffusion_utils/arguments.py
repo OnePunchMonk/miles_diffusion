@@ -1,4 +1,3 @@
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from miles.utils.http_utils import _wrap_ipv6
 
 
@@ -14,6 +13,10 @@ def add_sglang_diffusion_arguments(parser):
     """
     Add arguments to the parser for the SGLang server.
     """
+    # Imported here: sglang.multimodal_gen pulls in all of sglang (~14 s), and this module is imported by
+    # every process that touches miles.utils.arguments, including ones that never parse arguments.
+    from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
     parser = add_sglang_diffusion_router_arguments(parser)
     parser.add_argument("--sglang-server-concurrency", type=int, default=512)
 

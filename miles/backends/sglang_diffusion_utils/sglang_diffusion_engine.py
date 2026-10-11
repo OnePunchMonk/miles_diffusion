@@ -9,8 +9,8 @@ import time
 from typing import TYPE_CHECKING
 
 import requests
-from sglang.srt.utils.common import kill_process_tree
 
+import miles.utils.startup_timing as st
 from miles.ray.ray_actor import RayActor
 from miles.utils.arguments import rollout_merges_lora
 from miles.utils.http_utils import get_host_info
@@ -39,51 +39,97 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
 def _bootstrap_scheduler_process_with_rollout_patches(spec):
     # Re-apply patches here: the spawned scheduler grandchild re-imports modules fresh, losing the parent's patches.
     # Patch after platform init, as bootstrap orders it; its own init call is then a no-op.
+    st.set_role(f"scheduler{os.getpid()}")
+    st.mark("scheduler.enter")
     from sglang.multimodal_gen.runtime.managers.worker_bootstrap import bootstrap_scheduler_process
     from sglang.multimodal_gen.runtime.platforms import initialize_current_platform
 
     from miles.backends.sglang_diffusion_utils.monkey_patches import apply_env_selected_rollout_patches
 
-    initialize_current_platform()
-    apply_env_selected_rollout_patches()
-    bootstrap_scheduler_process(spec)
+    with st.step("scheduler.platform_and_patches"):
+        initialize_current_platform()
+        apply_env_selected_rollout_patches()
+    with st.step("scheduler.bootstrap"):
+        bootstrap_scheduler_process(spec)
 
 
-def _launch_server_target(server_args, apply_rollout_patches: bool = False):
+def _bootstrap_scheduler_process_timed(spec):
+    # Timing-only wrapper for the no-patch path; keeps the grandchild visible to the startup probes.
+    st.set_role(f"scheduler{os.getpid()}")
+    st.mark("scheduler.enter")
+    from sglang.multimodal_gen.runtime.managers.worker_bootstrap import bootstrap_scheduler_process
+
+    with st.step("scheduler.bootstrap"):
+        bootstrap_scheduler_process(spec)
+
+
+def _launch_server_target(args, host, port, nccl_port, apply_rollout_patches: bool = False):
+    # ServerArgs is built here, not in the engine actor: this process imports sglang anyway, and keeping
+    # sglang out of the actor takes one full sglang import (~40 s) off the engine startup path.
+    from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+    with st.step("server.build_server_args"):
+        server_args = ServerArgs.from_kwargs(**_compute_server_args(args, host=host, port=port, nccl_port=nccl_port))
+    server_args.host = server_args.host.strip("[]")
+
     # addict.Dict loses its `__frozen` attribute across spawn pickle; rebuild it.
     import addict
 
     if server_args.attention_backend_config is not None:
         server_args.attention_backend_config = addict.Dict(server_args.attention_backend_config)
 
-    if apply_rollout_patches:
-        # Rebind the scheduler entrypoint in launch_server's module so spawn pickles our patched wrapper by qualname.
-        import sglang.multimodal_gen.runtime.launch_server as _ls_mod
+    # Rebind the scheduler entrypoint in launch_server's module so spawn pickles our wrapper by qualname.
+    import sglang.multimodal_gen.runtime.launch_server as _ls_mod
 
-        _ls_mod.bootstrap_scheduler_process = _bootstrap_scheduler_process_with_rollout_patches
+    _ls_mod.bootstrap_scheduler_process = (
+        _bootstrap_scheduler_process_with_rollout_patches if apply_rollout_patches else _bootstrap_scheduler_process_timed
+    )
 
     from sglang.multimodal_gen.runtime.launch_server import launch_server
 
     launch_server(server_args)
 
 
+def _picklable_args(args):
+    """Copy of ``args`` that survives the plain pickle of a spawn start (Ray used cloudpickle to get it here)."""
+    import argparse
+    import pickle
+
+    kept = {}
+    for key, value in vars(args).items():
+        try:
+            pickle.dumps(value)
+        except Exception:
+            continue
+        kept[key] = value
+    return argparse.Namespace(**kept)
+
+
 def launch_server_process(
-    server_args: ServerArgs,
+    args,
+    host: str,
+    port: int,
+    nccl_port: int,
     apply_rollout_patches: bool = False,
 ) -> multiprocessing.Process:
+    """Start the sglang-d server in a child process and wait until it is healthy.
+
+    ``host`` is bracketed for IPv6 (as in the server URL); the child strips it for binding.
+    """
     # use spawn to avoid potential risks of fork in terms of subthreads or CUDA.
     multiprocessing.set_start_method("spawn", force=True)
-    server_args.host = server_args.host.strip("[]")
     p = multiprocessing.Process(
         target=_launch_server_target,
-        args=(server_args, apply_rollout_patches),
+        args=(_picklable_args(args), host, port, nccl_port, apply_rollout_patches),
     )
-    p.start()
+    with st.step("engine.spawn_server_process"):
+        p.start()
 
-    _wait_server_healthy(
-        base_url=server_args.url(),
-        is_process_alive=lambda: p.is_alive(),
-    )
+    with st.step("engine.wait_server_healthy"):
+        _wait_server_healthy(
+            base_url=f"http://{host}:{port}",
+            is_process_alive=lambda: p.is_alive(),
+        )
 
     return p
 
@@ -115,6 +161,8 @@ class SGLangDiffusionEngine(RayActor):
         self.base_gpu_id = base_gpu_id
 
     def init(self, dist_init_addr, port, nccl_port, host=None):
+        st.set_role(f"engine{self.rank}")
+        st.mark("engine.init_enter")
         # SGL-D runs single-node per engine; accept dist_init_addr for caller compat, then drop.
         del dist_init_addr
         self.router_ip = self.args.sglang_router_ip
@@ -134,22 +182,14 @@ class SGLangDiffusionEngine(RayActor):
 
         host = _format_v6_uri(host)
 
-        server_args_dict = _compute_server_args(
-            self.args,
-            host=host,
-            port=port,
-            nccl_port=nccl_port,
-        )
+        self.node_rank = getattr(self.args, "sglang_node_rank", None) or 0
+        self.server_host = host
+        self.server_port = port
+        self._nccl_port = nccl_port
 
-        self.node_rank = server_args_dict.get("node_rank", 0)
-        self.server_host = server_args_dict["host"]
-        self.server_port = server_args_dict["port"]
+        self._init_normal()
 
-        self._init_normal(server_args_dict)
-
-    def _init_normal(self, server_args_dict):
-        from sglang.multimodal_gen.runtime.server_args import ServerArgs
-
+    def _init_normal(self):
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
         self._pin_to_assigned_gpu()
         from miles.backends.sglang_diffusion_utils.monkey_patches import ROLLOUT_PATCH_GROUPS_ENV
@@ -159,16 +199,20 @@ class SGLangDiffusionEngine(RayActor):
             os.environ[ROLLOUT_PATCH_GROUPS_ENV] = ",".join(patch_groups)
             logger.info("Launching sglang-d with rollout patch groups: %s", patch_groups)
         self.process = launch_server_process(
-            ServerArgs.from_kwargs(**server_args_dict),
+            self.args,
+            host=self.server_host,
+            port=self.server_port,
+            nccl_port=self._nccl_port,
             apply_rollout_patches=bool(patch_groups),
         )
 
         if self.node_rank == 0 and self.router_ip and self.router_port:
             if self.args.use_miles_router:
-                response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/add_worker?url=http://{self.server_host}:{self.server_port}"
-                )
-                response.raise_for_status()
+                with st.step("engine.router_register"):
+                    response = requests.post(
+                        f"http://{self.router_ip}:{self.router_port}/add_worker?url=http://{self.server_host}:{self.server_port}"
+                    )
+                    response.raise_for_status()
             else:
                 # SGL-D router TODO: add_worker path for the non-miles router
                 logger.warning("Skipping router add_worker: only miles_router is supported for now")
@@ -339,6 +383,8 @@ class SGLangDiffusionEngine(RayActor):
 
             if response is not None:
                 response.raise_for_status()
+        from sglang.srt.utils.common import kill_process_tree
+
         kill_process_tree(self.process.pid)
 
     def release_memory_occupation(self):
