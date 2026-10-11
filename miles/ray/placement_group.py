@@ -1,5 +1,4 @@
 import logging
-import os
 import socket
 
 import ray
@@ -143,7 +142,8 @@ def create_training_models(args, pgs, rollout_manager):
             pg=pgs["actor"],
         )
     with st.step("driver.train_group.init_wait"):
-        gate_manager = rollout_manager if os.environ.get("MILES_STARTUP_GATE_REQUIRE_ENGINES") == "1" else None
+        # Colocated train ranks gate their GPU phase on the engines (see startup_gate.py).
+        gate_manager = rollout_manager if args.offload_rollout and not args.serial_startup else None
         start_rollout_ids = ray.get(
             actor_model.async_init(args, role="actor", with_ref=False, rollout_manager=gate_manager)
         )
@@ -177,13 +177,10 @@ def create_rollout_manager(args, pg):
         assert args.num_rollout > 0
         logger.info("Computed num_rollout=%s (num_rollout_per_epoch=%s)", args.num_rollout, num_rollout_per_epoch)
 
-    if args.offload_rollout and os.environ.get("MILES_STARTUP_SKIP_ROUNDTRIP") != "1":
-        if os.environ.get("MILES_STARTUP_OVERLAP") == "1":
-            # Don't block the driver: train init runs while engines boot and offload.
-            rollout_manager.offload.remote()
-        else:
-            with st.step("driver.rollout_manager.boot_offload"):
-                ray.get(rollout_manager.offload.remote())
+    # With overlapped startup the engines stay resident; the train gate offloads them only if needed.
+    if args.offload_rollout and args.serial_startup:
+        with st.step("driver.rollout_manager.boot_offload"):
+            ray.get(rollout_manager.offload.remote())
 
     logger.info("Rollout manager created.")
     return rollout_manager, num_rollout_per_epoch

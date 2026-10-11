@@ -109,6 +109,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--serial-startup",
+                action="store_true",
+                default=False,
+                help=(
+                    "Boot the rollout engines and the train actors one after the other, as before, "
+                    "instead of overlapping them. Only for debugging startup."
+                ),
+            )
+            parser.add_argument(
                 "--skip-train-actor-gc-collect",
                 action="store_true",
                 help=(

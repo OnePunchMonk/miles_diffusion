@@ -47,11 +47,6 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
-def _flag(name: str) -> bool:
-    # Startup-benchmark switches; each startup optimization is toggled independently.
-    return os.environ.get(name) == "1"
-
-
 @ray.remote
 class RolloutManager:
     """The class to run rollout and convert rollout data to training data."""
@@ -67,11 +62,7 @@ class RolloutManager:
         from miles.dashboard import hooks
 
         self._engine_init_handles = []
-        self._engines_first = _flag("MILES_STARTUP_ENGINES_FIRST") and not args.train_only and not args.debug_rollout_only
-        if self._engines_first:
-            # Engines only need the router address, and add_worker once healthy (35+ s later): boot them first.
-            _pick_router_addr(args)
-            self._launch_engines()
+        self._boot_offloaded = False
         with st.step("rm.dashboard_register"):
             hooks.register_rollout_manager(args)
         if not args.train_only:
@@ -118,7 +109,7 @@ class RolloutManager:
             self.all_rollout_engines = []
             self.num_new_engines = 0
             logger.info("RolloutManager using no sglang engines (train_only).")
-        elif not self._engines_first:
+        else:
             self._launch_engines()
         # pools outlive every rollout call, so the manager seats them and the rm functions find them as singletons
         _, bundle_indices, gpu_ids = pg
@@ -182,8 +173,8 @@ class RolloutManager:
         num_gpu_per_engine = min(args.rollout_num_gpus_per_engine, args.num_gpus_per_node)
         num_engines = args.rollout_num_gpus // num_gpu_per_engine
         self.all_rollout_engines = [None] * num_engines
-        # --debug-rollout-only crashes unless engine init is synced (see init_rollout_engines).
-        defer = _flag("MILES_STARTUP_OVERLAP") and not args.debug_rollout_only
+        # Defer so train init overlaps engine boot. --debug-rollout-only crashes unless init is synced.
+        defer = not args.serial_startup and not args.debug_rollout_only
         with st.step("rm.init_rollout_engines", num_engines=num_engines, deferred=int(defer)):
             self.num_new_engines, self._engine_init_handles = _init_rollout_engines(
                 args, self.pg, self.all_rollout_engines, defer_init=defer
@@ -200,6 +191,21 @@ class RolloutManager:
     def wait_engines_ready(self):
         self._ensure_engines_ready()
         return True
+
+    def boot_offload_once(self):
+        """Startup fallback when the train init peak does not fit next to the resident engines.
+
+        Train ranks call this concurrently; the actor runs calls one at a time, so only the first offloads.
+        """
+        if not self._boot_offloaded:
+            self._boot_offloaded = True
+            self.offload()
+        return True
+
+    def onload_weights_if_boot_offloaded(self):
+        if self._boot_offloaded:
+            self.onload_weights()
+        return self._boot_offloaded
 
     def get_rollout_engines_and_lock(self):
         self._ensure_engines_ready()
@@ -688,21 +694,14 @@ def _allocate_rollout_engine_addr_and_ports_normal(*, args, num_engines, rollout
     return addr_and_ports
 
 
-def _pick_router_addr(args):
-    if not hasattr(args, "_router_external"):
-        args._router_external = args.sglang_router_ip is not None
-    if args._router_external or args.sglang_router_port is not None and args.sglang_router_ip is not None:
+def _start_router(args):
+    """start sgl router and miles router"""
+    if args.sglang_router_ip is not None:
         return
+
     args.sglang_router_ip = _wrap_ipv6(get_host_info()[1])
     if args.sglang_router_port is None:
         args.sglang_router_port = find_available_port(random.randint(3000, 4000))
-
-
-def _start_router(args):
-    """start sgl router and miles router"""
-    _pick_router_addr(args)
-    if args._router_external:
-        return
 
     if args.use_miles_router:
         from miles.router.router import run_router
@@ -717,25 +716,10 @@ def _start_router(args):
     )
     process.daemon = True  # Set the process as a daemon
     process.start()
-    if _flag("MILES_STARTUP_ROUTER_POLL"):
-        _wait_port_open(args.sglang_router_ip, args.sglang_router_port, process)
-    else:
-        time.sleep(3)
+    # Wait 3 seconds
+    time.sleep(3)
     assert process.is_alive()
     logger.info(f"Router launched at {args.sglang_router_ip}:{args.sglang_router_port}")
-
-
-def _wait_port_open(host, port, process, timeout=30.0):
-    import socket
-
-    deadline = time.time() + timeout
-    host = host.strip("[]")
-    while time.time() < deadline and process.is_alive():
-        try:
-            with socket.create_connection((host, int(port)), timeout=0.2):
-                return
-        except OSError:
-            time.sleep(0.05)
 
 
 def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] | None = None):

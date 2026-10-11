@@ -35,9 +35,12 @@ def train(args):
         actor_model = create_training_models(args, pgs, rollout_manager)
     logger.info("train: training model ready")
 
-    if args.offload_rollout and os.environ.get("MILES_STARTUP_SKIP_ROUNDTRIP") != "1":
+    if args.offload_rollout:
         with st.step("driver.onload_rollout_weights"):
-            ray.get(rollout_manager.onload_weights.remote())
+            if args.serial_startup:
+                ray.get(rollout_manager.onload_weights.remote())
+            else:
+                ray.get(rollout_manager.onload_weights_if_boot_offloaded.remote())
 
     # always update weight first so that sglang has the loaded weights from training.
     with st.step("driver.first_update_weights"):

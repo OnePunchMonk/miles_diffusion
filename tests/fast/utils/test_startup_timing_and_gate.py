@@ -1,16 +1,44 @@
-import socket
 import subprocess
 import sys
 import textwrap
-import threading
-import time
 
 import pytest
 import torch
 
-import miles.utils.startup_timing as st
 from miles.backends.fsdp_utils import startup_gate
-from miles.ray import rollout
+
+
+class _Remote:
+    def __init__(self, fn):
+        self.fn = fn
+
+    def remote(self):
+        return self.fn()
+
+
+class FakeRolloutManager:
+    def __init__(self, on_offload=None):
+        self.calls = []
+        self.on_offload = on_offload
+        self.wait_engines_ready = _Remote(lambda: self.calls.append("wait") or True)
+        self.boot_offload_once = _Remote(self._offload)
+
+    def _offload(self):
+        self.calls.append("offload")
+        if self.on_offload:
+            self.on_offload()
+        return True
+
+
+@pytest.fixture
+def no_ray(monkeypatch):
+    monkeypatch.setattr(startup_gate.ray, "get", lambda x: x)
+
+
+def _free(monkeypatch, value):
+    state = {"free": value}
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (state["free"], 1 << 41), raising=False)
+    return state
 
 
 def test_required_bytes_is_shard_plus_largest_plus_margin():
@@ -28,56 +56,26 @@ def test_required_bytes_works_on_meta_params():
     assert startup_gate.required_bytes(model, 1, 0)[2] == 8 * 8 * 4 * 2
 
 
-def test_budget_gate_flag(monkeypatch):
-    monkeypatch.delenv("MILES_STARTUP_BUDGET_GATE", raising=False)
-    assert not startup_gate.budget_gate_enabled()
-    monkeypatch.setenv("MILES_STARTUP_BUDGET_GATE", "1")
-    assert startup_gate.budget_gate_enabled()
+def test_gate_keeps_engines_resident_when_it_fits(monkeypatch, no_ray):
+    _free(monkeypatch, 1 << 40)
+    rm = FakeRolloutManager()
+    startup_gate.wait_for_gpu_budget(torch.nn.Linear(4, 4), shard_world_size=1, rollout_manager=rm)
+    assert rm.calls == ["wait"]
 
 
-def test_gate_times_out_when_budget_never_fits(monkeypatch):
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (1, 2), raising=False)
+def test_gate_offloads_engines_when_it_does_not_fit(monkeypatch, no_ray):
+    state = _free(monkeypatch, 1)
+    rm = FakeRolloutManager(on_offload=lambda: state.update(free=1 << 40))
+    startup_gate.wait_for_gpu_budget(torch.nn.Linear(4, 4), shard_world_size=1, rollout_manager=rm)
+    assert rm.calls == ["wait", "offload"]
+
+
+def test_gate_raises_when_offload_does_not_free_enough(monkeypatch, no_ray):
+    _free(monkeypatch, 1)
     monkeypatch.setenv("MILES_STARTUP_GATE_TIMEOUT_S", "0.3")
+    rm = FakeRolloutManager()
     with pytest.raises(RuntimeError, match="startup gate"):
-        startup_gate.wait_for_gpu_budget(torch.nn.Linear(4, 4), shard_world_size=1)
-
-
-def test_gate_passes_when_budget_fits(monkeypatch):
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (1 << 40, 1 << 41), raising=False)
-    startup_gate.wait_for_gpu_budget(torch.nn.Linear(4, 4), shard_world_size=1)
-
-
-def test_wait_port_open_returns_once_listening():
-    srv = socket.socket()
-    srv.bind(("127.0.0.1", 0))
-    port = srv.getsockname()[1]
-    threading.Timer(0.3, srv.listen).start()
-
-    class Alive:
-        def is_alive(self):
-            return True
-
-    t0 = time.time()
-    rollout._wait_port_open("127.0.0.1", port, Alive(), timeout=5)
-    assert 0.2 < time.time() - t0 < 3
-    srv.close()
-
-
-def test_wait_port_open_gives_up_when_process_dies():
-    class Dead:
-        def is_alive(self):
-            return False
-
-    t0 = time.time()
-    rollout._wait_port_open("127.0.0.1", 9, Dead(), timeout=5)
-    assert time.time() - t0 < 1
-
-
-def test_pick_router_addr_respects_external_router():
-    args = type("A", (), {"sglang_router_ip": "10.0.0.1", "sglang_router_port": 1234})()
-    rollout._pick_router_addr(args)
-    assert (args.sglang_router_ip, args.sglang_router_port) == ("10.0.0.1", 1234)
-    assert args._router_external
+        startup_gate.wait_for_gpu_budget(torch.nn.Linear(4, 4), shard_world_size=1, rollout_manager=rm)
 
 
 def test_probe_lines_round_trip_through_parser(tmp_path):
