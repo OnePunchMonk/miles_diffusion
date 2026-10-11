@@ -174,3 +174,16 @@ def add_cached(parser: argparse.ArgumentParser, register) -> None:
         os.replace(tmp, path)
     except Exception as exc:
         logger.info("not caching sglang CLI args: %s", exc)
+
+
+def prime() -> str | None:
+    """Write the cache for the installed sglang (e.g. at image build time); returns its path."""
+    from miles.backends.sglang_diffusion_utils.arguments import add_sglang_diffusion_arguments
+
+    add_sglang_diffusion_arguments(argparse.ArgumentParser(add_help=False))
+    path = _cache_path()
+    return path if path and os.path.exists(path) else None
+
+
+if __name__ == "__main__":
+    print(prime() or "sglang CLI args not cacheable")
