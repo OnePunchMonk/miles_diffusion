@@ -70,7 +70,12 @@ def load_fsdp_models(
             cpu_offload=cpu_offload,
             args=args,
         )
-        checkpoint.broadcast_full_state_to_fsdp(model, full_state, cpu_offload=cpu_offload)
+        checkpoint.broadcast_full_state_to_fsdp(
+            model,
+            full_state,
+            cpu_offload=cpu_offload,
+            checkpoint_files=_checkpoint_files(checkpoint_path, component),
+        )
         del full_state
         train_pipeline_config.postprocess_model_after_materialize(model)
         if parallel_state.get_optional_mesh("sp") is not None:
@@ -86,6 +91,18 @@ def load_fsdp_models(
             move_model(model, "cpu")
         models[component] = model
     return models
+
+
+def _checkpoint_files(checkpoint_path: str, component: str) -> list[str] | None:
+    from . import sharded_checkpoint_fill
+
+    if not sharded_checkpoint_fill.enabled():
+        return None
+    try:
+        return sharded_checkpoint_fill.resolve_component_files(checkpoint_path, component) or None
+    except Exception as exc:  # no local snapshot, odd layout: fall back to the broadcast
+        logger.info("No checkpoint files for a sharded fill of %s: %s", component, exc)
+        return None
 
 
 def finish_fsdp_lazy_init(model: torch.nn.Module) -> None:
