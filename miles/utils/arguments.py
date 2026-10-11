@@ -109,6 +109,25 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--serial-startup",
+                action="store_true",
+                default=False,
+                help=(
+                    "Boot the rollout engines and the train actors one after the other, as before, "
+                    "instead of overlapping them. Only for debugging startup."
+                ),
+            )
+            parser.add_argument(
+                "--startup-engine-reserve-gib",
+                type=float,
+                default=None,
+                help=(
+                    "Upper bound on the GPU memory one colocated rollout engine rank holds after boot. When set, "
+                    "train ranks start their GPU load as soon as it fits next to that reserve instead of waiting "
+                    "for engine init to finish. Unset: wait for engine init."
+                ),
+            )
+            parser.add_argument(
                 "--skip-train-actor-gc-collect",
                 action="store_true",
                 help=(

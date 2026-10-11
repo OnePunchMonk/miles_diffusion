@@ -137,7 +137,11 @@ def create_training_models(args, pgs, rollout_manager):
         num_gpus_per_node=args.actor_num_gpus_per_node,
         pg=pgs["actor"],
     )
-    start_rollout_ids = ray.get(actor_model.async_init(args, role="actor", with_ref=False))
+    # Colocated train ranks gate their GPU phase on the engines (see startup_gate.py).
+    gate_manager = rollout_manager if args.offload_rollout and not args.serial_startup else None
+    start_rollout_ids = ray.get(
+        actor_model.async_init(args, role="actor", with_ref=False, rollout_manager=gate_manager)
+    )
     logger.info("Actor model initialized.")
 
     assert len(set(start_rollout_ids)) == 1
@@ -167,7 +171,8 @@ def create_rollout_manager(args, pg):
         assert args.num_rollout > 0
         logger.info("Computed num_rollout=%s (num_rollout_per_epoch=%s)", args.num_rollout, num_rollout_per_epoch)
 
-    if args.offload_rollout:
+    # With overlapped startup the engines stay resident; the train gate offloads them only if needed.
+    if args.offload_rollout and args.serial_startup:
         ray.get(rollout_manager.offload.remote())
 
     logger.info("Rollout manager created.")

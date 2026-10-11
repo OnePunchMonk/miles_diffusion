@@ -30,7 +30,10 @@ def train(args):
     logger.info("train: training model ready")
 
     if args.offload_rollout:
-        ray.get(rollout_manager.onload_weights.remote())
+        if args.serial_startup:
+            ray.get(rollout_manager.onload_weights.remote())
+        else:
+            ray.get(rollout_manager.onload_weights_if_boot_offloaded.remote())
 
     # always update weight first so that sglang has the loaded weights from training.
     actor_model.update_weights()

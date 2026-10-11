@@ -66,7 +66,7 @@ class FSDPTrainRayActor(TrainRayActor):
     """
 
     @with_defer(lambda: Timer().start("train_wait"))
-    def init(self, args: Namespace, role: str, with_ref: bool = False) -> int:  # type: ignore[override]
+    def init(self, args: Namespace, role: str, with_ref: bool = False, rollout_manager=None) -> int:  # type: ignore[override]
         super().init(args, role, with_ref)
 
         if args.deterministic_mode:
@@ -113,6 +113,7 @@ class FSDPTrainRayActor(TrainRayActor):
             lora_adapter_paths=args.lora_adapter_paths,
             trainable=True,
             cpu_offload=args.fsdp_cpu_offload,
+            rollout_manager=rollout_manager,
         )
         self.reference_models = {}
         if args.ref_load is not None:
@@ -124,6 +125,7 @@ class FSDPTrainRayActor(TrainRayActor):
                 checkpoint_path=args.ref_load,
                 lora_adapter_paths=args.ref_lora_adapter_paths,
                 cpu_offload=args.ref_cpu_offload,
+                rollout_manager=rollout_manager,
             )
         self.teacher_models = {}
         if args.teacher_load is not None:
@@ -135,6 +137,7 @@ class FSDPTrainRayActor(TrainRayActor):
                 checkpoint_path=args.teacher_load,
                 lora_adapter_paths=args.teacher_lora_adapter_paths,
                 cpu_offload=args.teacher_cpu_offload,
+                rollout_manager=rollout_manager,
             )
         # A natively CPU-offloaded model never sleeps: its parameters stay on the host and its buffers on the GPU.
         self.actor_models_to_sleep = [] if args.fsdp_cpu_offload else list(self.models.values())
