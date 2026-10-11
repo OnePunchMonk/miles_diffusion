@@ -118,6 +118,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--rollout-prespawn-schedulers",
+                action="store_true",
+                default=False,
+                help=(
+                    "Start the sglang-d scheduler workers before the server process imports sglang, so the two "
+                    "imports run in parallel. Needs sglang's launch_server.register_prespawned_schedulers."
+                ),
+            )
+            parser.add_argument(
                 "--startup-engine-reserve-gib",
                 type=float,
                 default=None,

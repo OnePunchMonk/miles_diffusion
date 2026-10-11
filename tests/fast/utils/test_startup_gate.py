@@ -155,3 +155,34 @@ def test_train_ranks_are_created_together_then_get_rank0_address(monkeypatch):
         ("set_addr", 1, "10.0.0.1", 29500),
         ("set_addr", 2, "10.0.0.1", 29500),
     ]
+
+
+def test_prespawned_workers_get_args_pipes_and_env_at_start(monkeypatch):
+    import multiprocessing as mp
+
+    from miles.backends.sglang_diffusion_utils.scheduler_prespawn import prespawn
+
+    workers = prespawn(2, target="tests.fast.utils.prespawn_fake_target:run")
+    monkeypatch.setenv("PRESPAWN_TEST_ENV", "set-after-prespawn")
+    readers, procs = [], []
+    for rank, worker in enumerate(workers):
+        reader, writer = mp.Pipe(duplex=False)
+        proc = worker(args=(rank, writer, {"rank": rank}), name=f"w{rank}")
+        proc.start()
+        writer.close()
+        readers.append(reader)
+        procs.append(proc)
+    got = sorted(reader.recv() for reader in readers)
+    for proc in procs:
+        proc.join(30)
+    assert got == [(0, {"rank": 0}, "set-after-prespawn"), (1, {"rank": 1}, "set-after-prespawn")]
+    assert [proc.exitcode for proc in procs] == [0, 0]
+
+
+def test_cancelled_prespawned_worker_exits_cleanly():
+    from miles.backends.sglang_diffusion_utils.scheduler_prespawn import prespawn
+
+    (worker,) = prespawn(1, target="tests.fast.utils.prespawn_fake_target:run")
+    worker.cancel()
+    worker._process.join(30)
+    assert worker._process.exitcode == 0

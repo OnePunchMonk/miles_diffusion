@@ -49,6 +49,13 @@ def _bootstrap_scheduler_process_with_rollout_patches(spec):
 
 
 def _launch_server_target(args, host, port, nccl_port, apply_rollout_patches: bool = False):
+    prespawned = None
+    if getattr(args, "rollout_prespawn_schedulers", False) and not apply_rollout_patches:
+        # Before any sglang import, so the workers import the same stack in parallel with this process.
+        from miles.backends.sglang_diffusion_utils.scheduler_prespawn import prespawn
+
+        prespawned = prespawn(args.rollout_num_gpus_per_engine)
+
     # ServerArgs is built here, not in the engine actor: this process imports sglang anyway, and keeping
     # sglang out of the actor takes one full sglang import (~40 s) off the engine startup path.
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -68,9 +75,16 @@ def _launch_server_target(args, host, port, nccl_port, apply_rollout_patches: bo
 
         _ls_mod.bootstrap_scheduler_process = _bootstrap_scheduler_process_with_rollout_patches
 
-    from sglang.multimodal_gen.runtime.launch_server import launch_server
+    import sglang.multimodal_gen.runtime.launch_server as launch_mod
 
-    launch_server(server_args)
+    if prespawned is not None:
+        if hasattr(launch_mod, "register_prespawned_schedulers"):
+            launch_mod.register_prespawned_schedulers(prespawned)
+        else:
+            logger.warning("--rollout-prespawn-schedulers needs sglang's register_prespawned_schedulers; ignoring it")
+            for worker in prespawned:
+                worker.cancel()
+    launch_mod.launch_server(server_args)
 
 
 def _picklable_args(args):
