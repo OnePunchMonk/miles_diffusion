@@ -118,3 +118,65 @@ def test_reserve_falls_back_to_waiting_for_engines_when_it_does_not_fit(monkeypa
         torch.nn.Linear(4, 4), shard_world_size=1, rollout_manager=rm, engine_reserve_gib=99
     )
     assert rm.calls == ["wait"]
+
+
+def test_picklable_args_drops_only_unpicklable_values():
+    import argparse
+    import pickle
+
+    from miles.backends.sglang_diffusion_utils.sglang_diffusion_engine import _picklable_args
+
+    args = argparse.Namespace(hf_checkpoint="m", sglang_tp_size=2, hook=lambda: None)
+    copy = _picklable_args(args)
+    assert vars(copy) == {"hf_checkpoint": "m", "sglang_tp_size": 2}
+    pickle.dumps(copy)
+
+
+def test_engine_module_does_not_import_sglang():
+    code = (
+        "import sys; import miles.backends.sglang_diffusion_utils.sglang_diffusion_engine, miles.ray.rollout; "
+        "print('sglang' in sys.modules)"
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout.strip()
+    assert out == "False"
+
+
+def test_train_ranks_are_created_together_then_get_rank0_address(monkeypatch):
+    import argparse
+    from types import SimpleNamespace
+
+    from miles.ray import actor_group
+
+    events = []
+
+    class FakeActor:
+        def __init__(self, rank):
+            self.rank = rank
+            self.get_master_addr_and_port = SimpleNamespace(
+                remote=lambda: events.append(("get_addr", self.rank)) or ("10.0.0.1", 29500)
+            )
+            self.set_master_addr_and_port = SimpleNamespace(
+                remote=lambda addr, port: events.append(("set_addr", self.rank, addr, port))
+            )
+
+    class FakeRemoteClass:
+        def options(self, **kwargs):
+            return SimpleNamespace(
+                remote=lambda world_size, rank, addr, port: events.append(("create", rank, addr)) or FakeActor(rank)
+            )
+
+    monkeypatch.setattr(actor_group.ray, "remote", lambda **kwargs: (lambda cls: FakeRemoteClass()))
+    monkeypatch.setattr(actor_group.ray, "get", lambda x: x)
+    monkeypatch.setattr(actor_group, "PlacementGroupSchedulingStrategy", lambda **kwargs: None)
+    args = argparse.Namespace(train_env_vars={}, deterministic_mode=False, train_backend="fsdp")
+
+    actor_group.RayTrainGroup(args, num_nodes=1, num_gpus_per_node=3, pg=(object(), [0, 1, 2], [0, 1, 2]))
+
+    assert events == [
+        ("create", 0, None),
+        ("create", 1, None),
+        ("create", 2, None),
+        ("get_addr", 0),
+        ("set_addr", 1, "10.0.0.1", 29500),
+        ("set_addr", 2, "10.0.0.1", 29500),
+    ]
