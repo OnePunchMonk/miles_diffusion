@@ -64,9 +64,20 @@ def _bootstrap_scheduler_process_timed(spec):
 
 
 def _launch_server_target(args, host, port, nccl_port, apply_rollout_patches: bool = False):
+    st.set_role(f"server{os.getpid()}")
+    prespawned = None
+    if os.environ.get("MILES_SGLD_PRESPAWN") == "1" and not apply_rollout_patches:
+        # Before any sglang import: the workers import the same stack in parallel with this process.
+        from miles.backends.sglang_diffusion_utils.scheduler_prespawn import prespawn
+
+        with st.step("server.prespawn_schedulers"):
+            prespawned = prespawn(args.rollout_num_gpus_per_engine)
+
     # ServerArgs is built here, not in the engine actor: this process imports sglang anyway, and keeping
     # sglang out of the actor takes one full sglang import (~40 s) off the engine startup path.
-    from sglang.multimodal_gen.runtime.server_args import ServerArgs
+    with st.step("server.import_sglang"):
+        from sglang.multimodal_gen.runtime.server_args import ServerArgs
+        import sglang.multimodal_gen.runtime.launch_server as _launch_mod
 
     with st.step("server.build_server_args"):
         server_args = ServerArgs.from_kwargs(**_compute_server_args(args, host=host, port=port, nccl_port=nccl_port))
@@ -85,9 +96,10 @@ def _launch_server_target(args, host, port, nccl_port, apply_rollout_patches: bo
         _bootstrap_scheduler_process_with_rollout_patches if apply_rollout_patches else _bootstrap_scheduler_process_timed
     )
 
-    from sglang.multimodal_gen.runtime.launch_server import launch_server
-
-    launch_server(server_args)
+    if prespawned is not None:
+        _launch_mod.register_prespawned_schedulers(prespawned)
+    st.mark("server.launch_server_call")
+    _launch_mod.launch_server(server_args)
 
 
 def _picklable_args(args):
