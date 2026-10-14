@@ -266,7 +266,9 @@ def prepare(ctx, batch, *, pad_to_len=None) -> PreparedBatch:
 
 Builds DiT inputs from train pairs. Defaults:
 `miles.backends.fsdp_utils.loss_hub.flow_grpo.prepare_flow_grpo_batch` or the NFT
-equivalent under `loss_hub.nft`.
+equivalent under `loss_hub.nft`. `PreparedBatch.latents`, `timesteps` and
+`timesteps_for_model` are keyed by latent stream name: `"visual"`, plus e.g.
+`"audio"` for joint audio-video models.
 
 ### `--custom-loss-function-path`
 
@@ -275,10 +277,12 @@ def loss_formula(ctx, batch, prepared, *, new_pred, ref_pred, metrics, **kwargs)
     ...
 ```
 
+`new_pred`, `old_pred` and `ref_pred` are keyed by the same stream names as `prepared.latents`.
+
 ### `--sde-step-backend-path`
 
 **Class** implementing `SdeStepBackend`. Auto-selected from
-`--diffusion-sde-type` (`sde` / `ode` → `DiffusersSdeStepBackend`, `cps` →
+`--diffusion-sde-type` (`sde` / `ode` → `FlowSdeStepBackend`, `cps` →
 `CpsSdeStepBackend`) unless overridden. See
 [SDE step backend](../advanced/sde-backend.md).
 
@@ -300,16 +304,17 @@ Return a truthy value to skip the default logging; falsy layers on top.
 
 ## Model family
 
-### `--hf-checkpoint` / `--diffusion-model-family` / `--train-pipeline-config-path`
+### `--hf-checkpoint` / `--diffusion-model-family` / `--diffusion-task` / `--train-pipeline-config-path`
 
 `--hf-checkpoint` names the diffusers pipeline for train + rollout. Family is
 resolved from the checkpoint name unless you pass `--diffusion-model-family`
-(e.g. `sd3`). For an unregistered family, pass `--train-pipeline-config-path`
-to a `TrainPipelineConfig` subclass instead.
+(e.g. `sd3`). `--diffusion-task` (e.g. `t2i`) must be one of the
+`tasks` that family's `TrainPipelineConfig` declares. For an unregistered family, pass
+`--train-pipeline-config-path` to a `TrainPipelineConfig` subclass instead.
 
 ### `--model-backend-path`
 
-**Class** for loading components / FSDP / scheduler. Default comes from the
+**Class** for loading components / FSDP. Default comes from the
 family config (usually a `DiffusersModelBackend`).
 
 ***

@@ -20,7 +20,7 @@ Reading the prefixes:
 | Prefix | Marks |
 |---|---|
 | `diffusion-` | The modality — denoising, SDE, CFG, latents, frames. Generic ML/RL concepts (clipping, KL, EMA, LoRA, batching) do not take it |
-| `fsdp-` | The training side — compare `--fsdp-flow-shift` (training-side sigma grid) with `--diffusion-flow-shift` (the engine's generation schedule) |
+| `fsdp-` | The training side — compare `--fsdp-flow-shift` (SFT training sigma grid) with `--diffusion-flow-shift` (the engine's generation schedule) |
 | `rollout-` / `sglang-` | The engine side |
 
 The prefix does not tell you which argument group a flag lives in — groups follow concern, not
@@ -30,13 +30,14 @@ name. `python3 train_diffusion.py --help` is always the ground truth.
 
 ## Essentials
 
-### The one required flag
+### The required flags
 
 | Flag | What |
 |---|---|
 | `--hf-checkpoint` | The diffusers pipeline to train, as an HF repo id or a local directory. |
+| `--diffusion-task` | The task to train on that family, e.g. `t2i` for SD3, `t2v` for Wan2.2. |
 
-One value serves three readers: training loads components and scheduler from it, the sglang-d
+One value serves three readers: training loads components from it, the sglang-d
 engine serves it, and the **model family** is matched from its name. Add
 `--diffusion-model-family` when the name carries no family hint — which local weights usually
 do not.
@@ -138,7 +139,8 @@ See [Dtype Control](../advanced/dtype-control.md).
 | `--sequence-parallel-size` | int | `1` | USP = Ulysses × Ring. |
 | `--ulysses-degree` | int | `0` | `0` = auto (Ulysses fills SP). Ring degree > 1 needs torch ≥ 2.11 and a ring-capable attention backend. |
 | `--fsdp-attention-backend` | str | – | diffusers `set_attention_backend` value. |
-| `--fsdp-flow-shift` | float | – | Training-side sigma grid shift, regenerated when no engine supplies scheduler meta (SFT). Distinct from `--diffusion-flow-shift`. |
+| `--fsdp-flow-shift` | str | – | SFT training sigma grid shift per latent stream, e.g. `visual=12,audio=3`; a bare number is the visual shift. RL pairs carry their rollout sigmas instead. Distinct from `--diffusion-flow-shift`. |
+| `--fsdp-supervised-streams` | str | `visual,audio` | Comma-separated latent streams the SFT loss supervises, among those the pair carries; must include `visual`. A stream left out is still noised and fed to the DiT but adds no loss. RL trajectories carry only the visual stream. |
 | `--gradient-checkpointing` | flag | off | |
 | `--deterministic-mode` | flag | off | See [Deterministic Training](../advanced/deterministic.md). |
 | `--train-env-vars` | JSON | `{}` | Extra env for the training processes. |
@@ -169,6 +171,7 @@ See [Dtype Control](../advanced/dtype-control.md).
 |---|---|---|---|
 | `--hf-checkpoint` | str | – | **Required.** Pipeline to train and to serve; also the family source. |
 | `--diffusion-model-family` | str | – | Registered family key: `sd3`, `wan2_2`, `ltx`, `qwen_image`, `cosmos3`. Overrides name matching. |
+| `--diffusion-task` | str | – | **Required** unless the config declares no `tasks`. The task to train, one of the family config's `tasks`: `t2i` (sd3, krea2, qwen_image, cosmos3), `t2v` (wan2_2, ltx), `t2va` (h3, the only H3 rollout task) or `ref2va` (h3 joint video/audio SFT with ordered references on `transformer_ref`). |
 | `--rollout-function-path` | str | `miles.rollout.sglang_rollout.generate_rollout` | Generic Miles default. Diffusion recipes explicitly set `miles.rollout.sglang_diffusion_rollout.generate_rollout`. |
 | `--train-pipeline-config-path` | str | – | Your own `TrainPipelineConfig` for an unregistered family. Mutually exclusive with `--diffusion-model-family`. |
 | `--model-backend-path` | str | – | Override the family's model loader. |
@@ -183,7 +186,7 @@ See [Dtype Control](../advanced/dtype-control.md).
 | `--diffusion-true-cfg-scale` | float | – | |
 | `--diffusion-negative-prompt` | str | – | Defaults to `" "` on the engine when CFG is on. |
 | `--diffusion-noise-level` | float | `0.7` | |
-| `--diffusion-height` / `--diffusion-width` | int | `512` | Rollout output size; SFT center-crop size. |
+| `--diffusion-height` / `--diffusion-width` | int | `512` | Rollout output size; SFT target media must already be this size. |
 | `--diffusion-h3-aspect-ratio` | str | `16:9` | MiniMax H3 only: `21:9` / `16:9` / `4:3` / `1:1` / `3:4` / `9:16`. |
 | `--diffusion-h3-duration-seconds` | float | `5.0` | MiniMax H3 only: rollout duration, 4.0–15.0 s. |
 | `--diffusion-audio-flow-shift` | float | `3.0` | MiniMax H3 only: audio flow shift for rollout. |
@@ -231,7 +234,7 @@ See [Dtype Control](../advanced/dtype-control.md).
 | `--num-epoch` | int | – | |
 | `--start-rollout-id` | int | – | Resumed from `--load` when unset. |
 | `--sft-encoder-checkpoint` | str | – | SFT only: tokenizer/text_encoder/vae source. |
-| `--sft-frame-stride` | int | `1` | SFT encode temporal stride. |
+| `--sft-frame-stride` | int | `1` | SFT encode temporal stride; target videos hold exactly `(num_frames - 1) * stride + 1` frames. |
 | `--sft-offload-encoder` | flag | off | SFT only: keep the frozen encoder in host RAM, on the GPU only during encode bursts. |
 
 ### Evaluation
@@ -271,9 +274,9 @@ See [Dtype Control](../advanced/dtype-control.md).
 | `--custom-prepare-train-batch-path` | str | – | Builds DiT inputs. |
 | `--custom-loss-function-path` | str | – | Loss **formula** only — the DiT forward stays in the actor. |
 | `--diffusion-nft-beta` | float | `1.0` | |
-| `--diffusion-nft-timestep-fraction` | float | `0.99` | Share of the rollout's denoising steps each sample trains on: `int(steps × fraction)` of its steps, drawn at random per sample. It counts steps, not a range of σ or timestep values; the final clean output (σ = 0) is never a training step. |
+| `--diffusion-nft-timestep-strategy-path` | str | `…nft.drop_random_steps` | `(args, num_steps, generator) -> list[int]` returning the denoising steps each sample trains on, in training order; `generator` is seeded per sample. Built in: `drop_random_steps` (random order), `drop_final_steps` (schedule order, noisiest first). The final clean output (σ = 0) is never a training step. |
+| `--diffusion-nft-num-dropped-timesteps` | int | `0` | Steps the built-in strategies drop: random ones per sample for `drop_random_steps`, the final (lowest-noise) ones for `drop_final_steps`. |
 | `--no-diffusion-nft-adaptive-weight` | flag | off | |
-| `--no-diffusion-nft-shuffle-timesteps` | flag | off | Train each sample's first steps in schedule order, noisiest first, instead of a random subset. |
 
 ### Reward
 
@@ -328,7 +331,7 @@ Every one takes a dotted path.
 | `--lora-adapter-path` | str+ | – | PEFT adapter directories the actor continues from, one per `--update-weight-target-module` entry, in order; `--lora-rank` / `--lora-alpha` must match their configs. |
 | `--lora-target-modules` | str+ | – | Defaults per model family. |
 | `--lora-init-weights` | str | `gaussian` | `kaiming-uniform` maps to PEFT's default; other PEFT schemes pass through. |
-| `--lora-ipc-weight-sync` | flag | off | Push only `lora_A`/`lora_B`; the engine merges locally. Requires `--use-lora`. |
+| `--lora-ipc-weight-sync` | flag | off | Push only `lora_A`/`lora_B` over CUDA IPC and let the rollout merge them (`weight_update_mode=lora_merge`); without it, the trainer merges LoRA into the base weights and pushes full weights. Requires `--use-lora` and `--colocate`. Without `--colocate`, LoRA always pushes `lora_A`/`lora_B` over NCCL for the rollout to merge. |
 
 ### EMA
 
@@ -351,6 +354,7 @@ Every one takes a dotted path.
 | `--load` | str | – | |
 | `--ckpt-step` | int | – | Defaults to `latest_checkpointed_iteration.txt`. |
 | `--no-load-optim` / `--no-load-rng` | flag | off | |
+| `--async-exact-resume` | flag | off | Async training only. Also checkpoints the EMA from before the latest step and resamples the first resumed batch with it, so a resume matches an uninterrupted run. Off: that batch samples the loaded EMA. |
 
 ### Logging
 
@@ -364,7 +368,7 @@ Every one takes a dotted path.
 | `--disable-wandb-random-suffix` | flag | off | Run names include a random suffix by default; pass this flag to disable it. |
 | `--wandb-log-num-images` | int | `0` | Images/videos per rollout; `0` disables. |
 | `--wandb-log-image-interval` | int | `1` | Send media every N rollouts. |
-| `--log-loss-sigma-bucket` | int | `10` | Sigma buckets for the per-bucket loss curves (emitted by the SFT loss); `0` disables. |
+| `--log-loss-sigma-bucket` | int | `10` | Sigma buckets for the per-bucket loss curves (emitted by the SFT loss): `loss_<stream>_sigma_*` for each supervised stream, bucketed by its own sigma; the total `loss` is never bucketed, since each stream reads the shared grid index through its own shift. `0` disables. |
 | `--use-miles-dashboard` | flag | off | Async phase/trajectory telemetry. |
 | `--miles-dashboard-workspace` | str | `./miles_dashboard` | |
 
@@ -407,8 +411,8 @@ not meant for manual runs.
 
 | `--diffusion-sde-type` | Backend | Dynamics |
 |---|---|---|
-| `sde` | `DiffusersSdeStepBackend` | Flow-matching SDE over diffusers scheduler sigmas. |
-| `ode` | `DiffusersSdeStepBackend` | Same class; deterministic rollout (used by NFT). |
-| `cps` | `CpsSdeStepBackend` | CPS kernel, σ = timestep ÷ divisor, log-prob without constants. |
+| `sde` | `FlowSdeStepBackend` | Flow-matching SDE over the rollout's recorded sigmas. |
+| `ode` | `FlowSdeStepBackend` | Same class; deterministic rollout (used by NFT). |
+| `cps` | `CpsSdeStepBackend` | CPS kernel over the rollout's recorded sigmas, log-prob without constants. |
 
 `--sde-step-backend-path` overrides the mapping with your own `SdeStepBackend` subclass.

@@ -22,7 +22,6 @@ from miles.utils.timer import Timer, inverse_timer, timer
 from miles.utils.tracking_utils import init_tracking
 from miles.utils.train_data_utils import (
     build_microbatch_schedule,
-    scheduler_meta_from_rollout,
     validate_same_microbatch_counts_across_train_ranks,
     validate_sample_aligned_windows,
 )
@@ -30,9 +29,11 @@ from miles.utils.train_data_utils import (
 from . import checkpoint
 from .device_move import move_model, move_optimizer, sleep_frozen_model, wake_up_frozen_model
 from .diffusion_update_weight_utils import (
+    DiffusionUpdateWeightFromDistributed,
     DiffusionUpdateWeightFromTensor,
     DiffusionUpdateWeightFromTensorLoRA,
     DiffusionUpdateWeightFromTensorLoRAIPC,
+    DiffusionUpdateWeightLoRADistributed,
 )
 from .ema import EMAOptimizer, reshard_model
 from .input_dtype_policy import apply_input_dtype_policy
@@ -101,7 +102,6 @@ class FSDPTrainRayActor(TrainRayActor):
         if args.deterministic_mode:
             # flash-attn is opaque to torch's determinism flag; backends patch their own dispatch.
             self.model_backend.enable_deterministic_attention(args.fsdp_attention_backend)
-        self.scheduler = self.model_backend.load_scheduler(args)
         self.models = load_fsdp_models(
             args,
             self.model_backend,
@@ -157,10 +157,7 @@ class FSDPTrainRayActor(TrainRayActor):
         else:
             self.model = torch.nn.ModuleDict(self.models)
 
-        self.sde_backend = load_function(args.sde_step_backend_path)(
-            self.scheduler,
-            sde_timestep_divisor=self.train_pipeline_config.sde_timestep_divisor,
-        )
+        self.sde_backend = load_function(args.sde_step_backend_path)()
 
         self.custom_prepare_train_batch_func = (
             load_function(args.custom_prepare_train_batch_path)
@@ -203,18 +200,26 @@ class FSDPTrainRayActor(TrainRayActor):
                 uprate=args.ema_decay_ramp,
                 uphold=args.ema_decay_max,
                 flat_steps=args.ema_decay_flat_steps,
+                keep_previous=args.async_exact_resume,
             )
         checkpoint_payload = checkpoint.load(self)
 
         # sglang-d now supports /update_weights_from_tensor (PR #20464).
         if self.args.train_only:
             self.weight_updater = None
-        elif self.args.use_lora and self.args.lora_ipc_weight_sync:
-            self.weight_updater = DiffusionUpdateWeightFromTensorLoRAIPC(self.args, self.models)
         elif self.args.use_lora:
-            self.weight_updater = DiffusionUpdateWeightFromTensorLoRA(self.args, self.models)
-        else:
+            if self.args.colocate:
+                if self.args.lora_ipc_weight_sync:
+                    updater = DiffusionUpdateWeightFromTensorLoRAIPC
+                else:
+                    updater = DiffusionUpdateWeightFromTensorLoRA
+            else:
+                updater = DiffusionUpdateWeightLoRADistributed
+            self.weight_updater = updater(self.args, self.models)
+        elif self.args.colocate:
             self.weight_updater = DiffusionUpdateWeightFromTensor(self.args, self.models)
+        else:
+            self.weight_updater = DiffusionUpdateWeightFromDistributed(self.args, self.models)
 
         checkpoint.finalize_load(self, checkpoint_payload)
 
@@ -264,7 +269,8 @@ class FSDPTrainRayActor(TrainRayActor):
         checkpoint.save(self, iteration=rollout_id)
 
     @timer
-    def update_weights(self) -> None:  # type: ignore[override]
+    def update_weights(self, previous_ema: bool = False) -> None:  # type: ignore[override]
+        """Push the rollout weights; ``previous_ema`` pushes the EMA before the latest step (async resume)."""
         if self.args.train_only or self.args.debug_rollout_only:
             return
 
@@ -282,7 +288,9 @@ class FSDPTrainRayActor(TrainRayActor):
                 ray.get(self.rollout_manager.clear_num_new_engines.remote())
 
         rollout_weight_context = (
-            self.ema_optimizer.use_weights(self.model) if self.args.rollout_weights == "ema" else nullcontext()
+            self.ema_optimizer.use_weights(self.model, previous=previous_ema)
+            if self.args.rollout_weights == "ema"
+            else nullcontext()
         )
         with rollout_weight_context:
             self.weight_updater.update_weights()
@@ -335,16 +343,6 @@ class FSDPTrainRayActor(TrainRayActor):
 
         num_pairs = len(train_pairs)
 
-        # ------------- Rollout Scheduler Metadata -------------
-        scheduler_timesteps, scheduler_sigmas = scheduler_meta_from_rollout(
-            rollout_data,
-            device=device,
-        )
-        self.scheduler.timesteps = scheduler_timesteps
-        self.scheduler.sigmas = scheduler_sigmas
-        self.scheduler._step_index = None
-        self.scheduler._begin_index = None
-
         # ------------- Micro-batch schedule -------------
         num_optim_steps_per_rollout = self.args.num_steps_per_rollout
         if num_pairs % num_optim_steps_per_rollout != 0:
@@ -376,7 +374,6 @@ class FSDPTrainRayActor(TrainRayActor):
             teacher_models=self.teacher_models,
             train_pipeline_config=self.train_pipeline_config,
             sde_backend=self.sde_backend,
-            scheduler=self.scheduler,
             args=self.args,
             forward_dtype=self._forward_dtype,
             device=device,
@@ -505,8 +502,12 @@ class FSDPTrainRayActor(TrainRayActor):
             default_dtype=forward_dtype,
         )
 
-        def _compute_noise_pred(model) -> torch.Tensor:
-            with torch.autocast("cuda", dtype=forward_dtype, enabled=forward_dtype != torch.float32):
+        def _compute_noise_pred(model) -> dict[str, torch.Tensor]:
+            with torch.autocast(
+                "cuda",
+                dtype=forward_dtype,
+                enabled=forward_dtype != torch.float32 and train_pipeline_config.enable_autocast,
+            ):
                 return train_pipeline_config.compute_noise_pred(
                     model=model,
                     latents_input=latents_in,
@@ -522,20 +523,20 @@ class FSDPTrainRayActor(TrainRayActor):
 
         new_pred = _compute_noise_pred(prepared.model)
 
-        # pi_old: the EMA weights the rollout sampled with.
+        # pi_old: the latest EMA, also when an async batch was sampled with the EMA before it.
         old_pred = None
         if self.args.loss_type == "nft":
             with torch.no_grad(), self.ema_optimizer.use_weights(prepared.model):
-                old_pred = _compute_noise_pred(prepared.model).detach()
+                old_pred = _compute_noise_pred(prepared.model)
 
         # KL reference.
         ref_pred = None
         if self.args.ref_mode == "ref":
             with torch.no_grad():
-                ref_pred = _compute_noise_pred(self.reference_models[prepared.component_name]).detach()
+                ref_pred = _compute_noise_pred(self.reference_models[prepared.component_name])
         elif self.args.ref_mode == "lora_base":
             with torch.no_grad(), prepared.model.disable_adapter():
-                ref_pred = _compute_noise_pred(prepared.model).detach()
+                ref_pred = _compute_noise_pred(prepared.model)
                 # PEFT re-enables adapter gradients on exit; reshard first so that lands on the shards, not gathered copies.
                 reshard_model(prepared.model)
 
