@@ -137,7 +137,9 @@ def create_training_models(args, pgs, rollout_manager):
         num_gpus_per_node=args.actor_num_gpus_per_node,
         pg=pgs["actor"],
     )
-    start_rollout_ids = ray.get(actor_model.async_init(args, role="actor", with_ref=False))
+    start_rollout_ids = ray.get(
+        actor_model.async_init(args, role="actor", with_ref=False, gpu_ready=_startup_gpu_ready(args, rollout_manager))
+    )
     logger.info("Actor model initialized.")
 
     assert len(set(start_rollout_ids)) == 1
@@ -149,6 +151,28 @@ def create_training_models(args, pgs, rollout_manager):
         ray.get(rollout_manager.load.remote(args.start_rollout_id - 1))
 
     return actor_model
+
+
+def engines_stay_resident_at_startup(args) -> bool:
+    """Whether colocated engines keep their weights through train init (no startup offload/onload)."""
+    return args.offload_rollout and not args.serial_startup and args.startup_engine_reserve_gib is not None
+
+
+def _startup_gpu_ready(args, rollout_manager):
+    """What colocated train ranks wait on before their first large GPU allocation (see startup_gate.py).
+
+    The train backend only gets this opaque handle; deciding what it stands for stays here.
+    """
+    if not args.offload_rollout or args.serial_startup:
+        return None
+    from miles.backends.fsdp_utils.startup_gate import GpuReady
+
+    if engines_stay_resident_at_startup(args):
+        # Engine memory is bounded by the reserve: ranks whose budget fits next to it go right away,
+        # the others wait for the engines to finish loading.
+        return GpuReady(rollout_manager.wait_engines_ready.remote())
+    # No bound on engine memory: release the engines first; they reload weights before the first sync.
+    return GpuReady(rollout_manager.offload.remote())
 
 
 def create_rollout_manager(args, pg):
@@ -167,7 +191,8 @@ def create_rollout_manager(args, pg):
         assert args.num_rollout > 0
         logger.info("Computed num_rollout=%s (num_rollout_per_epoch=%s)", args.num_rollout, num_rollout_per_epoch)
 
-    if args.offload_rollout:
+    # Overlapped startup decides the engines' startup offload in _startup_gpu_ready instead.
+    if args.offload_rollout and args.serial_startup:
         ray.get(rollout_manager.offload.remote())
 
     logger.info("Rollout manager created.")

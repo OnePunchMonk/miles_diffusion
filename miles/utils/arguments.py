@@ -109,6 +109,35 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--serial-startup",
+                action="store_true",
+                default=False,
+                help=(
+                    "Boot the rollout engines and the train actors one after the other, as before, "
+                    "instead of overlapping them. Only for debugging startup."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-prespawn-schedulers",
+                action="store_true",
+                default=False,
+                help=(
+                    "Start the sglang-d scheduler workers before the server process imports sglang, so the two "
+                    "imports run in parallel. Needs sglang's launch_server.register_prespawned_schedulers."
+                ),
+            )
+            parser.add_argument(
+                "--startup-engine-reserve-gib",
+                type=float,
+                default=None,
+                help=(
+                    "Upper bound (GiB) on the GPU memory one colocated rollout engine rank holds after boot. When "
+                    "set, the engines keep their weights through train init (no startup offload/onload) and a "
+                    "train rank starts its GPU load as soon as it fits next to that reserve. Unset: the engines "
+                    "are offloaded during train init and reloaded before the first weight sync."
+                ),
+            )
+            parser.add_argument(
                 "--skip-train-actor-gc-collect",
                 action="store_true",
                 help=(

@@ -3,7 +3,12 @@ import sys
 
 import ray
 
-from miles.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
+from miles.ray.placement_group import (
+    create_placement_groups,
+    create_rollout_manager,
+    create_training_models,
+    engines_stay_resident_at_startup,
+)
 from miles.utils.arguments import parse_args
 from miles.utils.logging_utils import configure_logger
 from miles.utils.misc import should_run_periodic_action
@@ -29,7 +34,7 @@ def train(args):
     actor_model = create_training_models(args, pgs, rollout_manager)
     logger.info("train: training model ready")
 
-    if args.offload_rollout:
+    if args.offload_rollout and not engines_stay_resident_at_startup(args):
         ray.get(rollout_manager.onload_weights.remote())
 
     # always update weight first so that sglang has the loaded weights from training.

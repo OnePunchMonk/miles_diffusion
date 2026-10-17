@@ -29,13 +29,6 @@ from miles.utils.train_data_utils import (
 
 from . import checkpoint
 from .device_move import move_model, move_optimizer, sleep_frozen_model, wake_up_frozen_model
-from .diffusion_update_weight_utils import (
-    DiffusionUpdateWeightFromDistributed,
-    DiffusionUpdateWeightFromTensor,
-    DiffusionUpdateWeightFromTensorLoRA,
-    DiffusionUpdateWeightFromTensorLoRAIPC,
-    DiffusionUpdateWeightLoRADistributed,
-)
 from .ema import EMAOptimizer, reshard_model
 from .input_dtype_policy import apply_input_dtype_policy
 from .loss_hub import DiffusionLossContext, flow_grpo_loss_formula, prepare_flow_grpo_batch
@@ -66,7 +59,7 @@ class FSDPTrainRayActor(TrainRayActor):
     """
 
     @with_defer(lambda: Timer().start("train_wait"))
-    def init(self, args: Namespace, role: str, with_ref: bool = False) -> int:  # type: ignore[override]
+    def init(self, args: Namespace, role: str, with_ref: bool = False, gpu_ready=None) -> int:  # type: ignore[override]
         super().init(args, role, with_ref)
 
         if args.deterministic_mode:
@@ -113,6 +106,7 @@ class FSDPTrainRayActor(TrainRayActor):
             lora_adapter_paths=args.lora_adapter_paths,
             trainable=True,
             cpu_offload=args.fsdp_cpu_offload,
+            gpu_ready=gpu_ready,
         )
         self.reference_models = {}
         if args.ref_load is not None:
@@ -124,6 +118,7 @@ class FSDPTrainRayActor(TrainRayActor):
                 checkpoint_path=args.ref_load,
                 lora_adapter_paths=args.ref_lora_adapter_paths,
                 cpu_offload=args.ref_cpu_offload,
+                gpu_ready=gpu_ready,
             )
         self.teacher_models = {}
         if args.teacher_load is not None:
@@ -135,6 +130,7 @@ class FSDPTrainRayActor(TrainRayActor):
                 checkpoint_path=args.teacher_load,
                 lora_adapter_paths=args.teacher_lora_adapter_paths,
                 cpu_offload=args.teacher_cpu_offload,
+                gpu_ready=gpu_ready,
             )
         # A natively CPU-offloaded model never sleeps: its parameters stay on the host and its buffers on the GPU.
         self.actor_models_to_sleep = [] if args.fsdp_cpu_offload else list(self.models.values())
@@ -208,6 +204,17 @@ class FSDPTrainRayActor(TrainRayActor):
                 keep_previous=args.async_exact_resume,
             )
         checkpoint_payload = checkpoint.load(self)
+
+        # Imported here, not at module level: it pulls in sglang (~25 s), which the driver and other
+        # processes that only need this class or fsdp_utils' helpers should not pay for. Not in a
+        # background thread either: concurrent imports of transformers are not safe.
+        from .diffusion_update_weight_utils import (
+            DiffusionUpdateWeightFromDistributed,
+            DiffusionUpdateWeightFromTensor,
+            DiffusionUpdateWeightFromTensorLoRA,
+            DiffusionUpdateWeightFromTensorLoRAIPC,
+            DiffusionUpdateWeightLoRADistributed,
+        )
 
         # sglang-d now supports /update_weights_from_tensor (PR #20464).
         if self.args.train_only:
