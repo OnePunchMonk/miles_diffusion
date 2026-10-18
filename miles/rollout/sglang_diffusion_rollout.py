@@ -108,6 +108,7 @@ class GenerateState(metaclass=SingletonMeta):
         self.semaphore = asyncio.Semaphore(
             args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
         )
+        self.num_engines = max(args.rollout_num_gpus // args.rollout_num_gpus_per_engine, 1)
         self.sampling_params = build_rollout_sampling_params(args)
         self.step_strategy_fn = (
             load_function(args.diffusion_step_strategy_path) if args.diffusion_step_strategy_path else None
@@ -146,20 +147,22 @@ class GenerateState(metaclass=SingletonMeta):
     def reset(self) -> None:
         self.remaining_batch_size = 0
         self.pendings = set()
+        # untouched copy of each submitted group, so unused extras can go back to the buffer
+        self.fresh_groups = {}
         self.aborted = False
 
     def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
         for group in samples:
-            self.pendings.add(
-                asyncio.create_task(
-                    generate_and_rm_group(
-                        self.args,
-                        group,
-                        sampling_params=self.sampling_params.copy(),
-                        evaluation=False,
-                    )
+            task = asyncio.create_task(
+                generate_and_rm_group(
+                    self.args,
+                    group,
+                    sampling_params=self.sampling_params.copy(),
+                    evaluation=False,
                 )
             )
+            self.fresh_groups[task] = copy.deepcopy(group)
+            self.pendings.add(task)
         self.remaining_batch_size += len(samples)
 
 
@@ -344,18 +347,20 @@ async def generate_rollout_async(
     ), "Now we don't support over sampling, please set --over_sampling_batch_size equal to --rollout_batch_size"
 
     data = []
+    # extra groups not needed once the target is met; their prompts go back to the buffer.
+    aborted_samples = []
     do_print = True
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
     try:
+        n_submit = target_data_size
         while len(data) < target_data_size:
-            while state.remaining_batch_size < target_data_size:
+            if n_submit > 0:
                 # get samples from the buffer and submit the generation requests.
-                # only top up the groups the filter dropped, so every fetched prompt is kept or dropped.
-                samples = data_source(target_data_size - state.remaining_batch_size)
-                state.submit_generate_tasks(samples)
+                state.submit_generate_tasks(data_source(n_submit))
 
             # wait for the generation to finish
             done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
+            n_dropped = 0
             for task in done:
                 group: list[Sample] = task.result()
 
@@ -371,18 +376,28 @@ async def generate_rollout_async(
                 if not dynamic_filter_output.keep:
                     metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
                     state.remaining_batch_size -= 1
+                    n_dropped += 1
                     continue
 
                 # add the samples to the data
                 if len(data) < target_data_size:
                     data.append(group)
                     pbar.update(args.n_samples_per_prompt)
+                else:
+                    aborted_samples.append(state.fresh_groups[task])
+
+            # always keep enough groups in flight to reach the target. on a drop, also refill
+            # every idle engine, so the tail doesn't run one group at a time on a single engine.
+            n_submit = target_data_size - len(data) - len(state.pendings)
+            if n_dropped:
+                n_submit = max(n_submit, state.num_engines - len(state.pendings))
     finally:
         pbar.close()
         # the event loop outlives this call; don't leave generation running into offload or weight sync.
         for task in state.pendings:
             task.cancel()
         await asyncio.gather(*state.pendings, return_exceptions=True)
+        aborted_samples += [state.fresh_groups[task] for task in state.pendings]
         # reset the global state to prevent effects on the next rollout or eval.
         state.reset()
 
@@ -391,8 +406,7 @@ async def generate_rollout_async(
         f"Finish rollout, prompt: {[str(sample.prompt)]}, reward: {sample.reward}",
     )
 
-    # TODO: oversampling and abort
-    # there are still some unfinished requests, abort them
+    # TODO: abort the extra requests on the sglang-diffusion engines instead of letting them finish
     # aborted_samples = await abort(args, rollout_id)
 
     assert len(data) == args.rollout_batch_size, f"Got {len(data)} samples, expected {args.rollout_batch_size}"
@@ -402,7 +416,7 @@ async def generate_rollout_async(
         filter_func = load_function(args.rollout_sample_filter_path)
         filter_func(args, data)
 
-    return RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect())
+    return RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect()), aborted_samples
 
 
 EVAL_PROMPT_DATASET = {}
@@ -528,6 +542,6 @@ def generate_rollout(
         output, _ = run(eval_rollout(args, rollout_id))
         return output
 
-    output = run(generate_rollout_async(args, rollout_id, data_source.get_samples))
-    # data_source.add_samples(aborted_samples)
+    output, aborted_samples = run(generate_rollout_async(args, rollout_id, data_source.get_samples))
+    data_source.add_samples(aborted_samples)
     return output

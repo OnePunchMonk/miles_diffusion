@@ -25,6 +25,8 @@ N_SAMPLES_PER_PROMPT = 2
 _inflight: set[str] = set()
 _started: list[str] = []
 _failing: set[str] = set()
+# when set, every group takes the same time and these prompt ids are dropped instead of every 4th
+_dropped_ids: set[int] | None = None
 
 
 def _prompt_id(sample) -> int:
@@ -35,9 +37,14 @@ async def fake_generate(args, microgroup, sampling_params, evaluation=False):
     prompt = microgroup[0].prompt
     _inflight.add(prompt)
     _started.append(prompt)
+    for sample in microgroup:
+        sample.request_id = f"req-{prompt}"
     try:
-        # uneven latency so groups finish out of submission order
-        await asyncio.sleep(0.01 * ((_prompt_id(microgroup[0]) * 7) % 5 + 1))
+        if _dropped_ids is not None:
+            await asyncio.sleep(0.05)
+        else:
+            # uneven latency so groups finish out of submission order
+            await asyncio.sleep(0.01 * ((_prompt_id(microgroup[0]) * 7) % 5 + 1))
         if prompt in _failing:
             raise RuntimeError(f"engine failed on {prompt}")
     finally:
@@ -47,7 +54,8 @@ async def fake_generate(args, microgroup, sampling_params, evaluation=False):
 
 async def fake_group_rm(args, samples):
     # every 4th prompt gets all-equal rewards, so check_reward_nonzero_std drops it
-    if _prompt_id(samples[0]) % 4 == 3:
+    dropped = _prompt_id(samples[0]) in _dropped_ids if _dropped_ids is not None else _prompt_id(samples[0]) % 4 == 3
+    if dropped:
         return [0.0] * len(samples)
     return [float(i) for i in range(len(samples))]
 
@@ -105,13 +113,16 @@ def _args(tmp_path):
 
 @pytest.fixture
 def rollout_env(tmp_path):
+    global _dropped_ids
     GenerateState.clear_instances()
     _inflight.clear()
     _started.clear()
     _failing.clear()
+    _dropped_ids = None
     fake_ctx = SimpleNamespace(get_node_id=lambda: "node-0")
     with patch.object(sglang_diffusion_rollout.ray, "get_runtime_context", return_value=fake_ctx):
         yield _args(tmp_path)
+    _dropped_ids = None
     GenerateState.clear_instances()
 
 
@@ -158,3 +169,34 @@ def test_failed_group_cancels_the_rest(rollout_env):
     output = generate_rollout(args, 1, data_source)
     assert len(output.samples) == ROLLOUT_BATCH_SIZE
     assert not _inflight
+
+
+def test_drop_refills_every_idle_engine(rollout_env):
+    # 4 engines, 4 groups wanted, equal latency (one wave = one group time):
+    #   wave 0: p0-p3,  p2 p3 dropped              -> 4 engines idle, submit 4
+    #   wave 1: p4-p7,  p5 p6 p7 dropped           -> 4 engines idle, submit 4
+    #   wave 2: p8-p11 all kept and finish together; whichever is seen first meets the target, the other 3 are extras
+    # refilling only the dropped count instead would run p6, p7, p8 one after another on one engine.
+    global _dropped_ids
+    _dropped_ids = {2, 3, 5, 6, 7}
+    args = rollout_env
+    args.rollout_batch_size = args.over_sampling_batch_size = 4
+    args.rollout_num_gpus = 4
+    data_source = RolloutDataSourceWithBuffer(args)
+
+    output = generate_rollout(args, 0, data_source)
+    assert not _inflight
+
+    kept = sorted(_prompt_id(group[0]) for group in output.samples)
+    extras = sorted(_prompt_id(group[0]) for group in data_source.buffer)
+    assert kept[:3] == [0, 1, 4]
+    assert sorted(kept[3:] + extras) == [8, 9, 10, 11]
+    # 12 groups in 3 waves of 4, never fewer groups in flight than engines
+    assert len(_started) == 12
+    # extras go back untouched, so the next rollout generates them from scratch
+    assert all(sample.request_id is None and sample.reward is None for group in data_source.buffer for sample in group)
+
+    _dropped_ids = set()
+    output = generate_rollout(args, 1, data_source)
+    assert sorted(_prompt_id(group[0]) for group in output.samples) == extras + [12]
+    assert not data_source.buffer
