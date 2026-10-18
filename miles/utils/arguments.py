@@ -113,7 +113,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 action=argparse.BooleanOptionalAction,
                 help=(
                     "Whether to offload the training actor to CPU during training. "
-                    "This will always be true when --colocate is set."
+                    "Defaults to on when --colocate is set."
                 ),
             )
             parser.add_argument(
@@ -121,7 +121,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 action=argparse.BooleanOptionalAction,
                 help=(
                     "Whether to offload the rollout generator to CPU during training. "
-                    "This will always be true when --colocate is set."
+                    "Defaults to on when --colocate is set."
                 ),
             )
             parser.add_argument(
@@ -275,7 +275,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 "--model-backend-path",
                 type=str,
                 default=None,
-                help="Model loading function path; default from the family config.",
+                help="Model backend class path, constructed with the family config; default from the family config.",
             )
             parser.add_argument(
                 "--diffusion-num-steps",
@@ -391,6 +391,13 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="generator_device field for POST /rollout/generate.",
             )
             parser.add_argument(
+                "--diffusion-quality",
+                type=str,
+                choices=["exact", "lossless", "high"],
+                default="exact",
+                help="sglang-diffusion request quality level; exact is the bit-identical reference path.",
+            )
+            parser.add_argument(
                 "--diffusion-sde-type",
                 type=str,
                 default="sde",
@@ -414,8 +421,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 "--diffusion-sde-window-range",
                 type=str,
                 default=None,
-                help="'lo,hi' bounds for the SDE window start (inclusive, exclusive). "
-                "Defaults to [0, num_inference_steps].",
+                help="'lo,hi': the whole SDE window lies in [lo, hi). " "Defaults to [0, num_inference_steps).",
             )
             parser.add_argument(
                 "--diffusion-sde-candidate-steps",
@@ -430,8 +436,9 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 "--diffusion-step-strategy-path",
                 type=str,
                 default=None,
-                help="Dotted path to a factory(args) -> StepStrategy callable. "
-                "Overrides --diffusion-num-sde-steps.",
+                help="Dotted path to `fn(args, sample, num_steps, seed) -> (sde_step_indices, "
+                "returned_latent_indices)`, called per engine request. The built-ins in "
+                "miles.rollout.step_strategy_hub read --diffusion-num-sde-steps.",
             )
             parser.add_argument(
                 "--diffusion-log-prob-no-const",
@@ -519,9 +526,10 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
                 help=(
-                    "Substitute the inner `def generate(args, sample, sampling_params)` call inside "
-                    "the diffusion rollout. Useful for multi-turn refinement / custom CFG schedules / "
-                    "specialised sampling pipelines. The function may optionally accept `evaluation=...`."
+                    "Substitute the per-microgroup generation call inside the diffusion rollout: "
+                    "`async def generate(args, microgroup: list[Sample], sampling_params) -> list[Sample]`. "
+                    "Useful for multi-turn refinement / custom CFG schedules / specialised sampling "
+                    "pipelines. The function may optionally accept `evaluation=...`."
                 ),
             )
             parser.add_argument(
@@ -568,10 +576,9 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
                 help=(
-                    "Per-sample loss-mask filter run after dynamic_sampling_filter. Signature: "
-                    "`def filter(args, data: list[list[Sample]]) -> None`. The function should set "
-                    "`sample.remove_sample = True` on samples that should be excluded from loss "
-                    "computation (they still participate in advantage normalisation)."
+                    "In-place hook run on the train rollout's groups before they are returned. Signature: "
+                    "`def filter(args, data: list[list[Sample]]) -> None`. Nothing downstream reads a "
+                    "per-sample drop flag, so it cannot exclude samples from the loss."
                 ),
             )
             # update weight
@@ -1757,6 +1764,24 @@ def validate_lora_weight_sync_args(args) -> None:
         )
 
 
+def validate_train_sde_backend(args) -> None:
+    """Reject rollouts the train-side SDE backend cannot score like the engine does."""
+    # The engine drops the Gaussian constants under this flag while FlowSdeStepBackend keeps them,
+    # so every old/new log-prob ratio would be off.
+    if args.diffusion_log_prob_no_const and args.diffusion_sde_type == "sde" and args.sde_step_backend_path is None:
+        raise ValueError(
+            "--diffusion-log-prob-no-const with --diffusion-sde-type sde needs a --sde-step-backend-path "
+            "whose log_prob also drops the constants"
+        )
+    # ODE rollouts carry zero log-probs and no noise; only a custom loss formula (NFT's is the default
+    # under --loss-type nft) can train on them, the Flow-GRPO one would score them as SDE steps.
+    if args.diffusion_sde_type == "ode" and args.custom_loss_function_path is None:
+        raise ValueError(
+            "--diffusion-sde-type ode is for DiffusionNFT (--loss-type nft) or a custom loss formula; "
+            "the Flow-GRPO loss needs an sde or cps rollout"
+        )
+
+
 def miles_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)
 
@@ -1983,7 +2008,7 @@ def miles_validate_args(args):
     validate_sp_args(args)
     validate_hybrid_shard_args(args)
 
-    # always true on offload for colocate at the moment.
+    # Offload defaults on under --colocate; an explicit --no-offload-* is kept.
     if args.colocate:
         if args.offload_train is None:
             args.offload_train = True
@@ -2042,6 +2067,7 @@ def miles_validate_args(args):
     # cps/ode log_probs drop Gaussian constants on both the engine and trainer sides.
     if args.diffusion_sde_type in ("cps", "ode"):
         args.diffusion_log_prob_no_const = True
+    validate_train_sde_backend(args)
 
     # The train-side scorer must replicate the rollout dynamics; derive it from the same knob.
     if args.sde_step_backend_path is None:
