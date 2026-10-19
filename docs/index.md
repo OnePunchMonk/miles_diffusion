@@ -27,7 +27,8 @@ pipeline, or from a native package when a family brings its own modeling. Shippe
   and very long contexts; training scales with **USP (Ulysses × Ring)**, built from each family's diffusers `_cp_plan` —
   or a self-written one — for agile model integration.
 - **LoRA training support.** With `--lora-ipc-weight-sync`, PEFT LoRA on the FSDP2 actor ships only
-  `lora_A`/`lora_B` pairs to colocated rollout engines over CUDA IPC and merges them engine-side. See
+  `lora_A`/`lora_B` pairs to colocated rollout engines over CUDA IPC; the engine merges them into its weights or
+  evaluates them unmerged, per `--sglang-lora-merge-mode`. See
   [LoRA Training and Weight Sync](advanced/lora.md).
 
 
@@ -35,14 +36,16 @@ pipeline, or from a native package when a family brings its own modeling. Shippe
 ## Supported models
 
 Each model name links to its recipe page. Every documented recipe is labeled with a
-[recipe verification level](user-guide/recipe-verification.md). Validated models also
-appear in the [Miles model list](https://miles.radixark.com/docs#supported-models).
+[recipe verification level](user-guide/recipe-verification.md). SD3.5, Qwen-Image, Wan2.2,
+LTX-2.3, Cosmos3-Nano, and MiniMax H3 also appear in the
+[Miles model list](https://miles.radixark.com/docs#supported-models).
 
 
 | Model                                                   | Task      | Canonical recipes                         |
 | ------------------------------------------------------- | --------- | ----------------------------------------- |
 | [Stable Diffusion 3.5](models/sd3/sd3.md)                 | T2I       | Flow-GRPO + OCR, Flow-GRPO + HPSv2.1, Flow-GRPO + OCR & PickScore, DiffusionNFT + PickScore |
 | [Qwen-Image](models/qwen-image/qwen-image.md)             | T2I       | Flow-GRPO + PickScore (flow_grpo-aligned) |
+| [Qwen-Image 2.1](models/qwen-image/qwen-image-21.md)      | T2I       | Flow-GRPO + PickScore                     |
 | [Wan2.2-T2V-A14B](models/wan/wan2-2.md)                   | T2V       | Flow-GRPO + PickScore, LoRA SFT           |
 | [LTX-2.3](models/ltx/ltx2.md)                             | T2V       | Flow-GRPO + PickScore                     |
 | [Cosmos3-Nano](models/cosmos/cosmos3.md)                   | T2I       | Flow-GRPO + PickScore                     |
@@ -68,7 +71,7 @@ appear in the [Miles model list](https://miles.radixark.com/docs#supported-model
 | LoRA + IPC weight sync                   | ✅     | ✅          | ✅      | 🟡    | ✅       |
 | Single-prompt multi-gen (microgroup > 1) | ✅     | ✅          | ✅      | 🟡       | ❌      |
 | USP sequence parallelism                 | ❌     | ❌          | ✅    | ❌       | ❌       |
-| Deterministic mode                       | ✅     | ✅          | ✅      | ✅       | ❌       |
+| Deterministic mode                       | ✅     | ✅          | ✅      | ✅       | ✅       |
 
 The built-in SFT rollout encodes only Wan2.2 and MiniMax H3 (`miles/rollout/encoder_hub/`); other families need a custom
 encoder or rollout.

@@ -19,7 +19,7 @@ baseline.
   `noise_pred` mean |Δ| was approximately `2e-2`. `postprocess_model_after_materialize` rebuilds the caches on device
   after FSDP wrapping.
 - **Variable-length text.** Conditioning is padded per batch with the attention mask derived
-  from `txt_seq_lens` — the mask itself is never transmitted from rollout.
+  from `txt_seq_lens`; the trainer rebuilds it and does not use a mask the engine may send for batched requests.
 
 ## 2. Supported variants
 
@@ -27,8 +27,9 @@ baseline.
 |---|---|---|
 | Qwen-Image | [`Qwen/Qwen-Image`](https://huggingface.co/Qwen/Qwen-Image) | Family key `qwen_image` |
 
-Any checkpoint whose name matches `qwen-image` resolves to the same config. For a
-differently-named local directory — the usual case — add `--diffusion-model-family qwen_image`.
+A checkpoint name containing `qwen-image` resolves to this config. A longer match
+such as `qwen-image-2.1` resolves to [Qwen-Image 2.1](qwen-image-21.md). For a
+differently-named local directory, add `--diffusion-model-family qwen_image`.
 
 ## 3. Family config
 

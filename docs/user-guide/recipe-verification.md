@@ -47,6 +47,8 @@ count as verification.
     full-finetune Flow-GRPO + PickScore.
   - `run_diffusion_nft_krea2_async.py` — Krea-2 8-GPU async DiffusionNFT + OCR.
 - **📈 V**
+  - `run_diffusion_grpo_qwenimage21_pickscore_1gpu.py` — Qwen-Image 2.1
+    Flow-GRPO + PickScore.
   - `run_diffusion_nft_krea2_8gpu.py` — Krea-2 8-GPU colocated DiffusionNFT + OCR.
   - `run_diffusion_nft_krea2.py` — Krea-2 2-GPU colocated DiffusionNFT + OCR.
   - `run_diffusion_nft_flux3_image_pickscore_8gpu.py` — FLUX 3 Image Klein 8-GPU colocated DiffusionNFT + PickScore.
