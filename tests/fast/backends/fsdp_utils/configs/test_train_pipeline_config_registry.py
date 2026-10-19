@@ -6,10 +6,12 @@
     {stream: latents}, cond --compute_noise_pred-------> {stream: noise pred}: no CFG | two-pass | joint-batch CFG
 
 What each test pins:
-  family resolution   HF ids and local paths match case-insensitively; unknown refs fail; the env var wins
+  family resolution   HF ids and local paths match case-insensitively, the longest pattern wins; unknown refs
+                      fail; the env var wins
   compute_noise_pred  no CFG is one pos pass; joint-batch CFG equals two-pass CFG
   timestep input      each family reproduces the arithmetic its sglang-d DiT runs
-  sigma input         sd3 / wan2_2 scale by num_train_timesteps = 1000; qwen_image / krea2 pass sigma through
+  sigma input         sd3 / wan2_2 scale by num_train_timesteps = 1000; qwen_image / qwen_image21 / krea2 pass
+                      sigma through
 """
 
 from tests.ci.ci_register import register_cpu_ci
@@ -21,6 +23,7 @@ import torch
 
 from miles.backends.fsdp_utils.configs.krea2 import Krea2TrainPipelineConfig
 from miles.backends.fsdp_utils.configs.qwen_image import QwenImageTrainPipelineConfig
+from miles.backends.fsdp_utils.configs.qwen_image21 import QwenImage21TrainPipelineConfig
 from miles.backends.fsdp_utils.configs.sd3 import SD3TrainPipelineConfig
 from miles.backends.fsdp_utils.configs.train_pipeline_config import TrainPipelineConfig, resolve_diffusion_model_family
 from miles.backends.fsdp_utils.configs.wan2_2 import Wan2_2TrainPipelineConfig
@@ -33,6 +36,10 @@ class TestFamilyResolution:
         "ref,family",
         [
             ("Qwen/Qwen-Image", "qwen_image"),
+            # Longer pattern wins: "qwen-image" is a substring of these ids.
+            ("Qwen/Qwen-Image-2.1", "qwen_image21"),
+            ("/data/ckpts/qwen-image-21", "qwen_image21"),
+            ("local/qwenimage21", "qwen_image21"),
             ("Wan-AI/Wan2.2-T2V-A14B", "wan2_2"),
             ("/data/ckpts/SD3.5-Medium-Finetune", "sd3"),
             ("krea/Krea-2-Raw", "krea2"),
@@ -121,8 +128,9 @@ class TestProcessTimestepAsInput:
         out = config_cls.process_timestep_as_input(config_cls, self.TIMESTEPS)
         assert torch.equal(out, self.TIMESTEPS)
 
-    def test_qwen_image_divides_by_the_model_normalizer(self):
-        out = QwenImageTrainPipelineConfig.process_timestep_as_input(QwenImageTrainPipelineConfig, self.TIMESTEPS)
+    @pytest.mark.parametrize("config_cls", [QwenImageTrainPipelineConfig, QwenImage21TrainPipelineConfig])
+    def test_qwen_image_divides_by_the_model_normalizer(self, config_cls):
+        out = config_cls.process_timestep_as_input(config_cls, self.TIMESTEPS)
         # One division, like the rollout: any rewrite of the expression drifts ULPs.
         assert torch.equal(out, self.TIMESTEPS / 1000.0)
 
@@ -139,7 +147,9 @@ class TestProcessSigmaAsTimestepsInput:
         out = config_cls.process_sigma_as_timesteps_input(config_cls, self.SIGMAS)
         assert torch.equal(out, self.SIGMAS * float(self.NUM_TRAIN_TIMESTEPS))
 
-    @pytest.mark.parametrize("config_cls", [QwenImageTrainPipelineConfig, Krea2TrainPipelineConfig])
+    @pytest.mark.parametrize(
+        "config_cls", [QwenImageTrainPipelineConfig, QwenImage21TrainPipelineConfig, Krea2TrainPipelineConfig]
+    )
     def test_passes_the_sigma_through(self, config_cls):
         out = config_cls.process_sigma_as_timesteps_input(config_cls, self.SIGMAS)
         assert torch.equal(out, self.SIGMAS)
