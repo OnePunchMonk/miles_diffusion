@@ -125,6 +125,26 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--startup-overlap",
+                choices=["off", "spawn", "init"],
+                default="off",
+                help=(
+                    "How much of train start-up overlaps the rollout engines' boot. 'spawn': create the train ranks "
+                    "(process start and imports) while the engines boot. 'init': also run their init; needs "
+                    "--num-rollout and, when colocated, --startup-keep-engines-resident, else it falls back to "
+                    "'spawn'. The order of the steps changes only in the driver."
+                ),
+            )
+            parser.add_argument(
+                "--startup-keep-engines-resident",
+                action="store_true",
+                default=False,
+                help=(
+                    "Skip the engines' offload after boot and the onload before the first weight sync. They stay on "
+                    "the GPU through train init, so it needs room for both."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-prespawn-schedulers",
                 action="store_true",
                 default=False,

@@ -141,7 +141,7 @@ def _wait_server_healthy(base_url, is_process_alive):
             if not is_process_alive():
                 raise Exception("Server process terminated unexpectedly.")
 
-            time.sleep(2)
+            time.sleep(0.5)
 
 
 class SGLangDiffusionEngine(RayActor):

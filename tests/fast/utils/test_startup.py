@@ -153,3 +153,85 @@ def test_cli_cache_is_skipped_for_unknown_types(monkeypatch, tmp_path):
 
     assert _parse(["--sglang-x", "q"], monkeypatch, tmp_path, register)["sglang_x"] == "Q"
     assert not (tmp_path / "args.json").exists()
+
+
+def _plan_args(**overrides):
+    from types import SimpleNamespace
+
+    base = dict(
+        startup_overlap="off",
+        startup_keep_engines_resident=False,
+        train_only=False,
+        debug_rollout_only=False,
+        num_rollout=5,
+        colocate=True,
+        offload_rollout=True,
+    )
+    return SimpleNamespace(**{**base, **overrides})
+
+
+@pytest.mark.parametrize(
+    "overrides, expected",
+    [
+        ({}, ("off", False)),
+        ({"startup_keep_engines_resident": True}, ("off", True)),
+        ({"startup_overlap": "spawn"}, ("spawn", False)),
+        ({"startup_overlap": "init", "startup_keep_engines_resident": True}, ("init", True)),
+        # init needs the engines resident when colocated, and --num-rollout
+        ({"startup_overlap": "init"}, ("spawn", False)),
+        ({"startup_overlap": "init", "startup_keep_engines_resident": True, "num_rollout": None}, ("spawn", True)),
+        # nothing offloaded: nothing to hold back
+        ({"startup_overlap": "init", "colocate": False, "offload_rollout": False}, ("init", False)),
+        ({"startup_overlap": "spawn", "train_only": True}, ("off", False)),
+        ({"startup_overlap": "init", "debug_rollout_only": True}, ("off", False)),
+    ],
+)
+def test_resolve_startup_plan(overrides, expected):
+    from miles.ray.placement_group import resolve_startup_plan
+
+    assert resolve_startup_plan(_plan_args(**overrides)) == expected
+
+
+def test_finish_rollout_manager_offloads_unless_resident(monkeypatch):
+    from miles.ray import placement_group
+
+    calls = []
+
+    class Method:
+        def __init__(self, name):
+            self.name = name
+
+        def remote(self):
+            calls.append(self.name)
+            return self.name
+
+    class Manager:
+        offload = Method("offload")
+        get_num_rollout_per_epoch = Method("per_epoch")
+        get_rollout_engines_and_lock = Method("ready")
+
+    monkeypatch.setattr(placement_group.ray, "get", lambda ref: 7 if ref == "per_epoch" else ref)
+
+    args = _plan_args(num_rollout=None, num_epoch=2)
+    assert placement_group.finish_rollout_manager(args, Manager) == 7
+    assert (args.num_rollout, calls) == (14, ["per_epoch", "offload"])
+
+    calls.clear()
+    args = _plan_args()
+    assert placement_group.finish_rollout_manager(args, Manager, offload=False, wait=True) is None
+    assert calls == ["ready"]
+
+
+@pytest.mark.parametrize(
+    "train_name, key",
+    [
+        ("blocks.0.attn.to_q.weight", "blocks.0.attn.to_q.weight"),
+        ("base_model.model.blocks.0.attn.to_q.base_layer.weight", "blocks.0.attn.to_q.weight"),
+        ("base_model.model.blocks.0.norm.weight", "blocks.0.norm.weight"),
+        ("blocks.0.attn.to_q.base_layer.weight", "blocks.0.attn.to_q.weight"),
+    ],
+)
+def test_checkpoint_key_strips_peft_wrapping(train_name, key):
+    from miles.backends.fsdp_utils.sharded_checkpoint_fill import _checkpoint_key
+
+    assert _checkpoint_key(train_name) == key

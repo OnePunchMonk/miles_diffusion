@@ -83,7 +83,8 @@ def index_files(files: list[str]) -> dict[str, tuple[str, int, torch.dtype, list
 
 
 def _checkpoint_key(name: str) -> str:
-    return name.replace(".base_layer.", ".")
+    """Checkpoint key of a train parameter: PEFT wraps the model (``base_model.model.``) and its linears (``.base_layer.``)."""
+    return name.removeprefix("base_model.model.").replace(".base_layer.", ".")
 
 
 def _local_rows(param: DTensor) -> tuple[int, int] | None:
