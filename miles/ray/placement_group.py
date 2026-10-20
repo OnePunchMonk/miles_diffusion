@@ -212,3 +212,32 @@ def finish_rollout_manager(args, rollout_manager, *, offload=True, wait=False):
 def create_rollout_manager(args, pg):
     rollout_manager = start_rollout_manager(args, pg)
     return rollout_manager, finish_rollout_manager(args, rollout_manager)
+
+
+def start_rollout_and_train(args, pgs):
+    """Create the rollout manager and the train group per ``--startup-overlap``.
+
+    Returns ``(rollout_manager, actor_model, num_rollout_per_epoch, engines_resident)``. The caller skips the
+    engines' onload when they are resident. The order of the steps is the only thing that changes with the mode;
+    each component is created and initialised exactly as ``create_rollout_manager`` / ``create_training_models`` do.
+    """
+    mode, resident = resolve_startup_plan(args)
+    logger.info("Startup overlap=%s, engines resident=%s", mode, resident)
+    # The engines boot inside the rollout manager actor; starting it does not wait for them.
+    rollout_manager = start_rollout_manager(args, pgs["rollout"])
+    if mode == "off":
+        num_rollout_per_epoch = finish_rollout_manager(args, rollout_manager, offload=not resident)
+        return rollout_manager, create_training_models(args, pgs, rollout_manager), num_rollout_per_epoch, resident
+
+    actor_model = allocate_train_group(
+        args=args,
+        num_nodes=args.actor_num_nodes,
+        num_gpus_per_node=args.actor_num_gpus_per_node,
+        pg=pgs["actor"],
+    )
+    init_refs = actor_model.async_init(args, role="actor", with_ref=False) if mode == "init" else None
+    num_rollout_per_epoch = finish_rollout_manager(args, rollout_manager, offload=not resident, wait=True)
+    if init_refs is None:
+        init_refs = actor_model.async_init(args, role="actor", with_ref=False)
+    actor_model = init_training_models(args, actor_model, init_refs, rollout_manager)
+    return rollout_manager, actor_model, num_rollout_per_epoch, resident

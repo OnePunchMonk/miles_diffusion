@@ -4,14 +4,7 @@ import sys
 import ray
 
 import miles.utils.startup_timing as st  # first, so its import time anchors the driver's
-from miles.ray.placement_group import (
-    allocate_train_group,
-    create_placement_groups,
-    finish_rollout_manager,
-    init_training_models,
-    resolve_startup_plan,
-    start_rollout_manager,
-)
+from miles.ray.placement_group import create_placement_groups, start_rollout_and_train
 from miles.utils.arguments import parse_args
 from miles.utils.logging_utils import configure_logger
 from miles.utils.misc import should_run_periodic_action
@@ -27,45 +20,14 @@ def train(args):
     logger.info("train: placement groups ready")
     init_tracking(args)
 
-    # create the rollout manager, with sglang engines inside.
+    # create the rollout manager, with sglang engines inside, and the training model.
     # need to initialize rollout manager first to calculate num_rollout
-    mode, resident = resolve_startup_plan(args)
-    logger.info("train: startup overlap=%s, engines resident=%s", mode, resident)
+    logger.info("train: creating rollout manager and training model")
     with st.step("driver.startup"):
-        # The engines boot inside the rollout manager actor; starting it does not wait for them.
-        rollout_manager = start_rollout_manager(args, pgs["rollout"])
-        init_refs = None
-        if mode != "off":
-            # Spawn the train ranks (process start, imports) while the engines boot.
-            actor_model = allocate_train_group(
-                args=args,
-                num_nodes=args.actor_num_nodes,
-                num_gpus_per_node=args.actor_num_gpus_per_node,
-                pg=pgs["actor"],
-            )
-            if mode == "init":
-                init_refs = actor_model.async_init(args, role="actor", with_ref=False)
-        with st.step("driver.rollout_manager"):
-            num_rollout_per_epoch = finish_rollout_manager(
-                args, rollout_manager, offload=not resident, wait=mode != "off"
-            )
-        logger.info("train: rollout manager ready")
+        rollout_manager, actor_model, num_rollout_per_epoch, engines_resident = start_rollout_and_train(args, pgs)
+    logger.info("train: rollout manager and training model ready")
 
-        logger.info("train: creating training model")
-        if mode == "off":
-            actor_model = allocate_train_group(
-                args=args,
-                num_nodes=args.actor_num_nodes,
-                num_gpus_per_node=args.actor_num_gpus_per_node,
-                pg=pgs["actor"],
-            )
-        if init_refs is None:
-            init_refs = actor_model.async_init(args, role="actor", with_ref=False)
-        with st.step("driver.train_init"):
-            actor_model = init_training_models(args, actor_model, init_refs, rollout_manager)
-        logger.info("train: training model ready")
-
-    if args.offload_rollout and not resident:
+    if args.offload_rollout and not engines_resident:
         ray.get(rollout_manager.onload_weights.remote())
 
     # always update weight first so that sglang has the loaded weights from training.

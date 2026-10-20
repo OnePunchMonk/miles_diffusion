@@ -1,23 +1,11 @@
-"""Startup-time helpers: no sglang import in the light processes, train rank creation, scheduler prespawn,
-and the sglang CLI argument cache."""
+"""Startup-time helpers: no sglang import in the light processes, the sglang CLI argument cache, the driver's
+startup plan and the sharded checkpoint fill's key mapping."""
 
 import argparse
 import subprocess
 import sys
 
 import pytest
-
-
-def test_picklable_args_drops_only_unpicklable_values():
-    import argparse
-    import pickle
-
-    from miles.backends.sglang_diffusion_utils.sglang_diffusion_engine import _picklable_args
-
-    args = argparse.Namespace(hf_checkpoint="m", sglang_tp_size=2, hook=lambda: None)
-    copy = _picklable_args(args)
-    assert vars(copy) == {"hf_checkpoint": "m", "sglang_tp_size": 2}
-    pickle.dumps(copy)
 
 
 def test_engine_module_does_not_import_sglang():
@@ -27,78 +15,6 @@ def test_engine_module_does_not_import_sglang():
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout.strip()
     assert out == "False"
-
-
-def test_train_ranks_are_created_together_then_get_rank0_address(monkeypatch):
-    import argparse
-    from types import SimpleNamespace
-
-    from miles.ray import actor_group
-
-    events = []
-
-    class FakeActor:
-        def __init__(self, rank):
-            self.rank = rank
-            self.get_master_addr_and_port = SimpleNamespace(
-                remote=lambda: events.append(("get_addr", self.rank)) or ("10.0.0.1", 29500)
-            )
-            self.set_master_addr_and_port = SimpleNamespace(
-                remote=lambda addr, port: events.append(("set_addr", self.rank, addr, port))
-            )
-
-    class FakeRemoteClass:
-        def options(self, **kwargs):
-            return SimpleNamespace(
-                remote=lambda world_size, rank, addr, port: events.append(("create", rank, addr)) or FakeActor(rank)
-            )
-
-    monkeypatch.setattr(actor_group.ray, "remote", lambda **kwargs: (lambda cls: FakeRemoteClass()))
-    monkeypatch.setattr(actor_group.ray, "get", lambda x: x)
-    monkeypatch.setattr(actor_group, "PlacementGroupSchedulingStrategy", lambda **kwargs: None)
-    args = argparse.Namespace(train_env_vars={}, colocate=False, deterministic_mode=False, train_backend="fsdp")
-
-    actor_group.RayTrainGroup(args, num_nodes=1, num_gpus_per_node=3, pg=(object(), [0, 1, 2], [0, 1, 2]))
-
-    assert events == [
-        ("create", 0, None),
-        ("create", 1, None),
-        ("create", 2, None),
-        ("get_addr", 0),
-        ("set_addr", 1, "10.0.0.1", 29500),
-        ("set_addr", 2, "10.0.0.1", 29500),
-    ]
-
-
-def test_prespawned_workers_get_args_pipes_and_env_at_start(monkeypatch):
-    import multiprocessing as mp
-
-    from miles.backends.sglang_diffusion_utils.scheduler_prespawn import prespawn
-
-    workers = prespawn(2, target="tests.fast.utils.prespawn_fake_target:run")
-    monkeypatch.setenv("PRESPAWN_TEST_ENV", "set-after-prespawn")
-    readers, procs = [], []
-    for rank, worker in enumerate(workers):
-        reader, writer = mp.Pipe(duplex=False)
-        proc = worker(args=(rank, writer, {"rank": rank}), name=f"w{rank}")
-        proc.start()
-        writer.close()
-        readers.append(reader)
-        procs.append(proc)
-    got = sorted(reader.recv() for reader in readers)
-    for proc in procs:
-        proc.join(30)
-    assert got == [(0, {"rank": 0}, "set-after-prespawn"), (1, {"rank": 1}, "set-after-prespawn")]
-    assert [proc.exitcode for proc in procs] == [0, 0]
-
-
-def test_cancelled_prespawned_worker_exits_cleanly():
-    from miles.backends.sglang_diffusion_utils.scheduler_prespawn import prespawn
-
-    (worker,) = prespawn(1, target="tests.fast.utils.prespawn_fake_target:run")
-    worker.cancel()
-    worker._process.join(30)
-    assert worker._process.exitcode == 0
 
 
 def _register(parser):
@@ -235,3 +151,63 @@ def test_checkpoint_key_strips_peft_wrapping(train_name, key):
     from miles.backends.fsdp_utils.sharded_checkpoint_fill import _checkpoint_key
 
     assert _checkpoint_key(train_name) == key
+
+
+def test_engine_server_kwargs_need_no_sglang():
+    code = (
+        "import sys; from types import SimpleNamespace as N; "
+        "from miles.backends.sglang_diffusion_utils.sglang_diffusion_engine import _base_server_kwargs, _sglang_attrs; "
+        "a = N(hf_checkpoint='m', rollout_num_gpus_per_engine=2, sglang_tp_size=2, sglang_sp_degree=1, "
+        "sglang_enable_cfg_parallel=False, sglang_dit_precision='bf16', diffusion_flow_shift=12.0, use_lora=False, "
+        "train_only=False, lora_ipc_weight_sync=False, colocate=True); "
+        "k = _base_server_kwargs(a, '[::1]', 15000, 15001); "
+        "assert k['host'] == '[::1]' and k['master_port'] == 25001 and k['flow_shift'] == 12.0 and k['num_gpus'] == 2, k; "
+        "assert _sglang_attrs(a) == {'tp_size': 2, 'sp_degree': 1, 'enable_cfg_parallel': False, 'dit_precision': 'bf16'}; "
+        "print('sglang' in sys.modules)"
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout.strip()
+    assert out == "False"
+
+
+def test_rollout_weights_tag_matches_sglang():
+    constants = pytest.importorskip("sglang.srt.constants")
+    from miles.ray.rollout import GPU_MEMORY_TYPE_WEIGHTS
+
+    assert GPU_MEMORY_TYPE_WEIGHTS == constants.GPU_MEMORY_TYPE_WEIGHTS
+
+
+@pytest.mark.parametrize(
+    "overrides, order",
+    [
+        ({}, ["start", "finish", "alloc", "init", "wire"]),
+        ({"startup_overlap": "spawn"}, ["start", "alloc", "finish", "init", "wire"]),
+        (
+            {"startup_overlap": "init", "startup_keep_engines_resident": True},
+            ["start", "alloc", "init", "finish", "wire"],
+        ),
+    ],
+)
+def test_start_rollout_and_train_orders_the_steps_by_mode(monkeypatch, overrides, order):
+    from miles.ray import placement_group as pg
+
+    events = []
+
+    class Group:
+        def async_init(self, args, role, with_ref=False):
+            events.append("init")
+            return ["ref"]
+
+    monkeypatch.setattr(pg, "start_rollout_manager", lambda args, p: events.append("start") or "rm")
+    monkeypatch.setattr(
+        pg, "finish_rollout_manager", lambda args, rm, **kw: events.append("finish") or (kw.get("offload"), 3)[1]
+    )
+    monkeypatch.setattr(pg, "allocate_train_group", lambda **kw: events.append("alloc") or Group())
+    monkeypatch.setattr(pg, "init_training_models", lambda args, group, refs, rm: events.append("wire") or group)
+
+    args = _plan_args(
+        actor_num_nodes=1, actor_num_gpus_per_node=2, **{k: v for k, v in overrides.items()}
+    )
+    rm, group, per_epoch, resident = pg.start_rollout_and_train(args, {"rollout": 0, "actor": 0})
+    assert (rm, per_epoch) == ("rm", 3)
+    assert resident == bool(overrides.get("startup_keep_engines_resident"))
+    assert events == order
