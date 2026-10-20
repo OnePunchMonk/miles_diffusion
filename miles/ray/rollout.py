@@ -537,6 +537,8 @@ def init_rollout_engines(args, pg, all_rollout_engines):
             # The RunAI streamer is copy-bound (~2.4 GiB/s even from a warm page cache); mmap is much faster.
             "SGLANG_USE_RUNAI_MODEL_STREAMER": "false",
         }
+        if args.startup_skip_p2p_check:
+            env_vars["SGLANG_SKIP_P2P_CHECK"] = "1"
         if rollout_merges_lora(args):
             # Merge in the train forward dtype, not fp32, to cut train/rollout consistency error.
             env_vars["SGLANG_DIFFUSION_LORA_MERGE_FP32"] = "1" if args.diffusion_forward_dtype == "fp32" else "0"

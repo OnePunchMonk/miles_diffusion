@@ -145,6 +145,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--startup-skip-p2p-check",
+                action="store_true",
+                default=False,
+                help=(
+                    "Set SGLANG_SKIP_P2P_CHECK=1 on the rollout engines: sglang trusts the driver's P2P report "
+                    "instead of timing a copy between every GPU pair (~28 s on a fresh container on 2x H200)."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-prespawn-schedulers",
                 action="store_true",
                 default=False,
